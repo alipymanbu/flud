@@ -97,24 +97,24 @@ class FludClient(object):
     'connect' to the flud network via a gateway, for instance).  Use the
     recursive primitives for doing DHT ops.
     """
-    async def send_k_find_node(self, host, port, key):
-        return await send_k_find_node(self.node, host, port, key)
+    async def send_k_find_node(self, host, port, key, metrics=None):
+        return await send_k_find_node(self.node, host, port, key, metrics=metrics)
 
-    async def send_k_store(self, host, port, key, val):
-        return await send_k_store(self.node, host, port, key, val)
+    async def send_k_store(self, host, port, key, val, metrics=None):
+        return await send_k_store(self.node, host, port, key, val, metrics=metrics)
 
-    async def send_k_find_value(self, host, port, key):
-        return await send_k_find_value(self.node, host, port, key)
+    async def send_k_find_value(self, host, port, key, metrics=None):
+        return await send_k_find_value(self.node, host, port, key, metrics=metrics)
     
     """
     DHT recursive primitives (recursive calls to muliple peers)
     """
-    async def k_find_node(self, key):
-        return await k_find_node(self.node, key)
+    async def k_find_node(self, key, metrics=None):
+        return await k_find_node(self.node, key, metrics=metrics)
     
-    async def k_store(self, key, val):
-        return await k_store(self.node, key, val)
+    async def k_store(self, key, val, metrics=None):
+        return await k_store(self.node, key, val, metrics=metrics)
     
-    async def k_find_value(self, key):
-        return await k_find_value(self.node, key)
+    async def k_find_value(self, key, metrics=None):
+        return await k_find_value(self.node, key, metrics=metrics)
     

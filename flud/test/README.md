@@ -69,6 +69,24 @@ Run only stress suites:
 poetry run pytest -vv -m stress
 ```
 
+Run the standalone DHT benchmark harness:
+
+```sh
+poetry run python3 flud/test/dht_benchmark.py
+```
+
+Example tuned run:
+
+```sh
+poetry run python3 flud/test/dht_benchmark.py \
+  --nodes 25 \
+  --clients 4 \
+  --ops-per-phase 100 \
+  --concurrency 25 \
+  --warmup-ops 150 \
+  --output /tmp/dht-benchmark.json
+```
+
 ## Custom Pytest Options
 
 Shared network target:

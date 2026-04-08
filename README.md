@@ -63,6 +63,7 @@ make test
 make test-integration
 make test-stress
 make test-all
+make benchmark-dht
 ```
 
 These map to:
@@ -71,6 +72,7 @@ These map to:
 - `make test-integration`: tests marked `integration`
 - `make test-stress`: tests marked `stress`
 - `make test-all`: all pytest-discovered tests
+- `make benchmark-dht`: run the standalone DHT benchmark harness
 
 For more detailed test commands, custom pytest options, and the retained manual
 file-op system runner, see [flud/test/README.md](/Users/alenpeacock/code/flud/flud/test/README.md).

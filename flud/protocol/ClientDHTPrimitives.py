@@ -9,7 +9,6 @@ from http import HTTPStatus
 import flud.FludkRouting as FludkRouting
 from flud.fencode import fencode
 from flud.async_runtime import maybe_await
-
 from .ClientPrimitives import _normalize_headers
 from .FludCommUtil import *
 
@@ -45,13 +44,25 @@ The active DHT client path is asyncio-native. Single-hop helpers use the
 """
 
 
-async def send_k_find_node(node, host, port, key, command_name="nodes"):
+async def send_k_find_node(node, host, port, key, command_name="nodes", metrics=None):
     return await maybe_await(
             node.async_runtime.submit(
-                _send_k_find_node(node, host, port, key, command_name)))
+                _send_k_find_node(node, host, port, key, command_name, metrics)))
 
 
-async def _send_k_find_node(node, host, port, key, command_name="nodes"):
+def _is_timeout_error(exc):
+    return isinstance(exc, (asyncio.TimeoutError, socket.timeout))
+
+
+def _operation_trace(metrics, op_type, **context):
+    if metrics is None:
+        return None
+    if hasattr(metrics, "start_operation"):
+        return metrics.start_operation(op_type, **context)
+    return metrics
+
+
+async def _send_k_find_node(node, host, port, key, command_name="nodes", metrics=None):
     if aiohttp is None:
         raise RuntimeError("aiohttp not available for async DHT request")
     host = getCanonicalIP(host)
@@ -63,6 +74,8 @@ async def _send_k_find_node(node, host, port, key, command_name="nodes"):
     timeoutcount = 0
     while True:
         try:
+            if metrics:
+                metrics.record_rpc_attempt()
             timeout = aiohttp.ClientTimeout(total=kprimitive_to)
             resp = await node.async_http.request(
                     "GET", url,
@@ -83,18 +96,20 @@ async def _send_k_find_node(node, host, port, key, command_name="nodes"):
             updateNodes(node.client, node.config, response['k'])
             return response
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            if metrics:
+                metrics.record_rpc_failure(timed_out=_is_timeout_error(exc))
             timeoutcount += 1
             if timeoutcount >= MAXTIMEOUTS:
                 raise socket.error(str(exc))
 
 
-async def send_k_find_value(node, host, port, key):
+async def send_k_find_value(node, host, port, key, metrics=None):
     return await maybe_await(
             node.async_runtime.submit(
-                _send_k_find_value(node, host, port, key)))
+                _send_k_find_value(node, host, port, key, metrics)))
 
 
-async def _send_k_find_value(node, host, port, key):
+async def _send_k_find_value(node, host, port, key, metrics=None):
     if aiohttp is None:
         raise RuntimeError("aiohttp not available for async DHT request")
     host = getCanonicalIP(host)
@@ -106,6 +121,8 @@ async def _send_k_find_value(node, host, port, key):
     timeoutcount = 0
     while True:
         try:
+            if metrics:
+                metrics.record_rpc_attempt()
             timeout = aiohttp.ClientTimeout(total=kprimitive_to)
             resp = await node.async_http.request(
                     "GET", url,
@@ -131,18 +148,20 @@ async def _send_k_find_value(node, host, port, key):
             updateNodes(node.client, node.config, response['k'])
             return response
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            if metrics:
+                metrics.record_rpc_failure(timed_out=_is_timeout_error(exc))
             timeoutcount += 1
             if timeoutcount >= MAXTIMEOUTS:
                 raise socket.error(str(exc))
 
 
-async def send_k_store(node, host, port, key, val):
+async def send_k_store(node, host, port, key, val, metrics=None):
     return await maybe_await(
             node.async_runtime.submit(
-                _send_k_store(node, host, port, key, val)))
+                _send_k_store(node, host, port, key, val, metrics)))
 
 
-async def _send_k_store(node, host, port, key, val):
+async def _send_k_store(node, host, port, key, val, metrics=None):
     if aiohttp is None:
         raise RuntimeError("aiohttp not available for async kSTORE")
     host = getCanonicalIP(host)
@@ -154,6 +173,8 @@ async def _send_k_store(node, host, port, key, val):
     timeoutcount = 0
     while True:
         try:
+            if metrics:
+                metrics.record_rpc_attempt()
             timeout = aiohttp.ClientTimeout(total=kprimitive_to)
             resp = await node.async_http.request(
                     "PUT", url,
@@ -171,12 +192,14 @@ async def _send_k_store(node, host, port, key, val):
             logger.info("kSTORE to %s:%d finished", host, port)
             return body
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            if metrics:
+                metrics.record_rpc_failure(timed_out=_is_timeout_error(exc))
             timeoutcount += 1
             if timeoutcount >= MAXTIMEOUTS:
                 raise socket.error(str(exc))
 
 
-async def k_find_node(node, key):
+async def _k_find_node_impl(node, key, op_metrics=None):
     node.DHTtstamp = time.time()
     queried = {}
     outstanding = set()
@@ -192,11 +215,15 @@ async def k_find_node(node, key):
             if response['k'][0] not in kclosest:
                 kclosest.insert(0, response['k'][0])
                 del kclosest[FludkRouting.k:]
+            if op_metrics:
+                op_metrics.set_returned_candidate_count(len(response['k']))
             return response
 
         responder_id = int(response['id'], 16)
         outstanding.discard((host, port, responder_id))
         queried[responder_id] = (host, port)
+        if op_metrics:
+            op_metrics.record_queried_node(responder_id)
 
         for candidate in response['k']:
             node_tuple = (candidate[0], candidate[1], candidate[2])
@@ -232,13 +259,16 @@ async def k_find_node(node, key):
         pending[:] = pending[len(batch):]
         if not batch:
             break
+        if op_metrics:
+            op_metrics.record_round()
         logger.debug("FN: %s doing async round %d", abbrv, round_no)
         round_no += 1
 
         async def _query_one(host, port, node_id):
             outstanding.add((host, port, node_id))
             try:
-                response = await send_k_find_node(node, host, port, key)
+                response = await send_k_find_node(
+                    node, host, port, key, metrics=op_metrics)
                 return response, host, port
             finally:
                 outstanding.discard((host, port, node_id))
@@ -265,10 +295,27 @@ async def k_find_node(node, key):
     logger.info("kFindNode %s terminated successfully after %d queries.",
             abbrv, len(queried))
     kclosest.sort(key=lambda n, t=key: t ^ n[2])
-    return {'k': kclosest[:FludkRouting.k]}
+    result = {'k': kclosest[:FludkRouting.k]}
+    if op_metrics:
+        op_metrics.set_returned_candidate_count(len(result['k']))
+    return result
 
 
-async def k_find_value(node, key):
+async def k_find_node(node, key, metrics=None):
+    op_metrics = _operation_trace(metrics, "k_find_node", key=fencode(key))
+    try:
+        result = await _k_find_node_impl(node, key, op_metrics=op_metrics)
+    except Exception as exc:
+        if op_metrics:
+            op_metrics.finish_failure(exc, timed_out=_is_timeout_error(exc))
+        raise
+    if op_metrics:
+        op_metrics.finish_success()
+    return result
+
+
+async def k_find_value(node, key, metrics=None):
+    op_metrics = _operation_trace(metrics, "k_find_value", key=fencode(key))
     node.DHTtstamp = time.time()
     queried = {}
     outstanding = set()
@@ -287,6 +334,8 @@ async def k_find_value(node, key):
         if not isinstance(response, dict):
             if response is not None:
                 _remember_value(response)
+                if op_metrics:
+                    op_metrics.set_value_found(True)
             done = True
             pending[:] = []
             outstanding.clear()
@@ -294,6 +343,8 @@ async def k_find_value(node, key):
 
         responder_id = int(response['id'], 16)
         queried[responder_id] = (host, port)
+        if op_metrics:
+            op_metrics.record_queried_node(responder_id)
         for candidate in response['k']:
             node_tuple = (candidate[0], candidate[1], candidate[2])
             if candidate[2] not in queried and \
@@ -314,65 +365,103 @@ async def k_find_value(node, key):
         return None
 
     localhost = getCanonicalIP('localhost')
-    initial = await send_k_find_value(node, localhost, node.config.port, key)
-    exact = _update_state(initial, localhost, node.config.port)
-    if exact is not None and not isinstance(exact, dict):
-        return exact
+    try:
+        initial = await send_k_find_value(
+            node, localhost, node.config.port, key, metrics=op_metrics)
+        exact = _update_state(initial, localhost, node.config.port)
+        if exact is not None and not isinstance(exact, dict):
+            if op_metrics:
+                op_metrics.finish_success()
+            return exact
 
-    round_no = 0
-    while not done and (pending or outstanding):
-        batch = pending[:FludkRouting.a]
-        pending[:] = pending[len(batch):]
-        if not batch:
-            break
-        logger.debug("FV: %s doing async round %d", abbrv, round_no)
-        round_no += 1
+        round_no = 0
+        while not done and (pending or outstanding):
+            batch = pending[:FludkRouting.a]
+            pending[:] = pending[len(batch):]
+            if not batch:
+                break
+            if op_metrics:
+                op_metrics.record_round()
+            logger.debug("FV: %s doing async round %d", abbrv, round_no)
+            round_no += 1
 
-        async def _query_one(host, port, node_id):
-            outstanding.add((host, port, node_id))
-            try:
-                response = await send_k_find_value(node, host, port, key)
-                return response, host, port
-            finally:
-                outstanding.discard((host, port, node_id))
+            async def _query_one(host, port, node_id):
+                outstanding.add((host, port, node_id))
+                try:
+                    response = await send_k_find_value(
+                        node, host, port, key, metrics=op_metrics)
+                    return response, host, port
+                finally:
+                    outstanding.discard((host, port, node_id))
 
+            results = await asyncio.gather(
+                *(_query_one(host, port, node_id) for host, port, node_id in batch),
+                return_exceptions=True,
+            )
+            for item, result in zip(batch, results):
+                host, port, node_id = item
+                if isinstance(result, Exception):
+                    logger.info("kFindValue %s request to %s:%d failed -- %s",
+                            abbrv, host, port, str(result))
+                    kclosest[:] = [
+                        n for n in kclosest
+                        if (n[0], n[1], n[2]) != (host, port, node_id)
+                    ]
+                    continue
+                response, host, port = result
+                exact = _update_state(response, host, port)
+                if exact is not None and not isinstance(exact, dict):
+                    if op_metrics:
+                        op_metrics.finish_success()
+                    return exact
+
+        if not values:
+            logger.info("couldn't get any results")
+            if op_metrics:
+                op_metrics.finish_success()
+            return None
+        result = max(values.items(), key=lambda item: item[1])[0]
+        if op_metrics:
+            op_metrics.finish_success()
+        return result
+    except Exception as exc:
+        if op_metrics:
+            op_metrics.finish_failure(exc, timed_out=_is_timeout_error(exc))
+        raise
+
+
+async def k_store(node, key, val, metrics=None):
+    op_metrics = _operation_trace(metrics, "k_store", key=fencode(key))
+    try:
+        knodes = await _k_find_node_impl(node, key, op_metrics=op_metrics)
+        knodes = knodes['k']
+        if op_metrics:
+            op_metrics.set_store_destination_count(len(knodes))
+            op_metrics.set_returned_candidate_count(len(knodes))
+        if len(knodes) < 1:
+            raise RuntimeError("can't complete kStore -- no nodes")
         results = await asyncio.gather(
-            *(_query_one(host, port, node_id) for host, port, node_id in batch),
+            *(send_k_store(node, knode[0], knode[1], key, val, metrics=op_metrics)
+              for knode in knodes),
             return_exceptions=True,
         )
-        for item, result in zip(batch, results):
-            host, port, node_id = item
+        failures = []
+        for result in results:
             if isinstance(result, Exception):
-                logger.info("kFindValue %s request to %s:%d failed -- %s",
-                        abbrv, host, port, str(result))
-                kclosest[:] = [
-                    n for n in kclosest
-                    if (n[0], n[1], n[2]) != (host, port, node_id)
-                ]
-                continue
-            response, host, port = result
-            exact = _update_state(response, host, port)
-            if exact is not None and not isinstance(exact, dict):
-                return exact
-
-    if not values:
-        logger.info("couldn't get any results")
-        return None
-    return max(values.items(), key=lambda item: item[1])[0]
-
-
-async def k_store(node, key, val):
-    knodes = await k_find_node(node, key)
-    knodes = knodes['k']
-    if len(knodes) < 1:
-        raise RuntimeError("can't complete kStore -- no nodes")
-    results = await asyncio.gather(
-        *(send_k_store(node, knode[0], knode[1], key, val)
-          for knode in knodes),
-        return_exceptions=True,
-    )
-    failures = [result for result in results if isinstance(result, Exception)]
-    if failures:
-        raise RuntimeError(results)
-    logger.info("kStore finished")
-    return ""
+                failures.append(result)
+                if op_metrics:
+                    op_metrics.record_store_failure(
+                        timed_out=_is_timeout_error(result))
+            else:
+                if op_metrics:
+                    op_metrics.record_store_success()
+        if failures:
+            raise RuntimeError(results)
+        logger.info("kStore finished")
+        if op_metrics:
+            op_metrics.finish_success()
+        return ""
+    except Exception as exc:
+        if op_metrics:
+            op_metrics.finish_failure(exc, timed_out=_is_timeout_error(exc))
+        raise
