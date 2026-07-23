@@ -113,18 +113,21 @@ class FludClient(object):
         return await k_find_node(
             self.node, key, metrics=metrics, alpha=alpha, alpha_mode=alpha_mode)
     
-    async def k_store(self, key, val, metrics=None, alpha=None, alpha_mode="fixed"):
+    async def k_store(self, key, val, metrics=None, alpha=None, alpha_mode="fixed",
+            write_quorum=None):
         return await k_store(
-            self.node, key, val, metrics=metrics, alpha=alpha, alpha_mode=alpha_mode)
-    
+            self.node, key, val, metrics=metrics, alpha=alpha, alpha_mode=alpha_mode,
+            write_quorum=write_quorum)
+
     async def k_find_value(self, key, metrics=None, alpha=None, alpha_mode="fixed",
-            value_policy="first"):
+            value_policy="first", read_quorum=None):
         return await k_find_value(
             self.node,
             key,
             metrics=metrics,
             alpha=alpha,
             alpha_mode=alpha_mode,
+            read_quorum=read_quorum,
             value_policy=value_policy,
         )
     

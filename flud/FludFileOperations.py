@@ -1516,11 +1516,15 @@ class UpdateManifest:
                 err, "couldn't store manifest")
         return await self._updateCAS(stored)
 
-    def _updateCAS(self, stored):
+    async def _updateCAS(self, stored):
         key, meta = stored
-        logger.info("storing %s at %x" % (key, 
+        logger.info("storing %s at %x" % (key,
             int(self.node.config.nodeID,16)))
-        return self.node.client.k_store(int(self.node.config.nodeID,16), key)
+        result = await self.node.client.k_store(int(self.node.config.nodeID,16), key)
+        # Cached so the DHT republish loop can keep this pointer alive under
+        # churn without re-encoding/re-storing the whole manifest each time.
+        self.node.config.manifest_cas = key
+        return result
 
     def _updateManifestErr(self, err, msg):
         logger.warning(msg)

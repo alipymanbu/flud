@@ -340,6 +340,8 @@ async def _benchmark_call(
     alpha,
     alpha_mode,
     value_policy,
+    write_quorum=None,
+    read_quorum=None,
 ):
     op = collector.start_operation(
         opname,
@@ -362,10 +364,12 @@ async def _benchmark_call(
                 alpha=alpha,
                 alpha_mode=alpha_mode,
                 value_policy=value_policy,
+                read_quorum=read_quorum,
             )
         elif opname == "k_store":
             coro = client.client.k_store(
-                key, TESTVAL, metrics=op, alpha=alpha, alpha_mode=alpha_mode)
+                key, TESTVAL, metrics=op, alpha=alpha, alpha_mode=alpha_mode,
+                write_quorum=write_quorum)
         else:
             raise ValueError("unknown op %s" % opname)
         result = await asyncio.wait_for(coro, timeout=timeout)
@@ -388,6 +392,8 @@ async def _run_phase(
     alpha,
     alpha_mode,
     value_policy,
+    write_quorum=None,
+    read_quorum=None,
 ):
     collector = DHTMetricsCollector()
     semaphore = asyncio.Semaphore(concurrency)
@@ -407,6 +413,8 @@ async def _run_phase(
                 alpha,
                 alpha_mode,
                 value_policy,
+                write_quorum=write_quorum,
+                read_quorum=read_quorum,
             )
 
     tasks = [
@@ -420,7 +428,8 @@ async def _run_phase(
     return summary
 
 
-async def _warmup(clients, keys, concurrency, timeout, alpha, alpha_mode, value_policy):
+async def _warmup(clients, keys, concurrency, timeout, alpha, alpha_mode, value_policy,
+        write_quorum=None, read_quorum=None):
     mixed = []
     for index, key in enumerate(keys):
         op = ("k_find_node", key)
@@ -431,13 +440,16 @@ async def _warmup(clients, keys, concurrency, timeout, alpha, alpha_mode, value_
         mixed.append(op)
     await _run_phase(
         "warmup", "warmup", clients, mixed, concurrency, timeout,
-        alpha, alpha_mode, value_policy)
+        alpha, alpha_mode, value_policy,
+        write_quorum=write_quorum, read_quorum=read_quorum)
 
 
-async def _prepopulate_values(client, keys, timeout, alpha, alpha_mode):
+async def _prepopulate_values(client, keys, timeout, alpha, alpha_mode, write_quorum=None):
     for key in keys:
         await asyncio.wait_for(
-            client.client.k_store(key, TESTVAL, alpha=alpha, alpha_mode=alpha_mode),
+            client.client.k_store(
+                key, TESTVAL, alpha=alpha, alpha_mode=alpha_mode,
+                write_quorum=write_quorum),
             timeout=timeout,
         )
 
@@ -483,7 +495,17 @@ def _build_parser():
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--alpha", type=int, default=3)
     parser.add_argument("--alpha-mode", choices=["fixed", "adaptive"], default="fixed")
-    parser.add_argument("--value-policy", choices=["first", "majority"], default="first")
+    parser.add_argument("--value-policy", choices=["first", "majority", "quorum"], default="first")
+    parser.add_argument(
+        "--write-quorum", type=int, default=None,
+        help="Number of the k replica targets a k_store must reach before "
+             "returning (defaults to floor(k/2)+1; remaining targets "
+             "continue as best-effort background stores).")
+    parser.add_argument(
+        "--read-quorum", type=int, default=None,
+        help="With --value-policy=quorum, number of matching responses "
+             "required before a k_find_value returns (defaults to "
+             "k - write_quorum + 1).")
     parser.add_argument(
         "--dht-latency-ms", default=None,
         help="Simulated per-hop DHT RPC latency injected server-side "
@@ -517,7 +539,8 @@ async def _run_benchmark(args):
         warmup_keys = all_keys[: args.warmup_ops]
 
         await _prepopulate_values(
-            cluster.clients[0], find_value_keys, args.timeout, args.alpha, args.alpha_mode)
+            cluster.clients[0], find_value_keys, args.timeout, args.alpha, args.alpha_mode,
+            write_quorum=args.write_quorum)
         phase_keys = _build_phase_keys(
             find_node_keys,
             find_value_keys,
@@ -533,6 +556,7 @@ async def _run_benchmark(args):
                     "k_find_node", "cold", cluster.clients, phase_keys["find_node"],
                     args.concurrency, args.timeout,
                     args.alpha, args.alpha_mode, args.value_policy,
+                    write_quorum=args.write_quorum, read_quorum=args.read_quorum,
                 )
             )
             phase_results.append(
@@ -540,6 +564,7 @@ async def _run_benchmark(args):
                     "k_find_value", "cold", cluster.clients, phase_keys["find_value"],
                     args.concurrency, args.timeout,
                     args.alpha, args.alpha_mode, args.value_policy,
+                    write_quorum=args.write_quorum, read_quorum=args.read_quorum,
                 )
             )
             phase_results.append(
@@ -547,18 +572,21 @@ async def _run_benchmark(args):
                     "k_store", "cold", cluster.clients, phase_keys["cold_store"],
                     args.concurrency, args.timeout,
                     args.alpha, args.alpha_mode, args.value_policy,
+                    write_quorum=args.write_quorum, read_quorum=args.read_quorum,
                 )
             )
 
         if not args.cold_only:
             await _warmup(
                 cluster.clients, warmup_keys, args.concurrency, args.timeout,
-                args.alpha, args.alpha_mode, args.value_policy)
+                args.alpha, args.alpha_mode, args.value_policy,
+                write_quorum=args.write_quorum, read_quorum=args.read_quorum)
             phase_results.append(
                 await _run_phase(
                     "k_find_node", "warm", cluster.clients, phase_keys["find_node"],
                     args.concurrency, args.timeout,
                     args.alpha, args.alpha_mode, args.value_policy,
+                    write_quorum=args.write_quorum, read_quorum=args.read_quorum,
                 )
             )
             phase_results.append(
@@ -566,6 +594,7 @@ async def _run_benchmark(args):
                     "k_find_value", "warm", cluster.clients, phase_keys["find_value"],
                     args.concurrency, args.timeout,
                     args.alpha, args.alpha_mode, args.value_policy,
+                    write_quorum=args.write_quorum, read_quorum=args.read_quorum,
                 )
             )
             phase_results.append(
@@ -573,6 +602,7 @@ async def _run_benchmark(args):
                     "k_store", "warm", cluster.clients, phase_keys["warm_store"],
                     args.concurrency, args.timeout,
                     args.alpha, args.alpha_mode, args.value_policy,
+                    write_quorum=args.write_quorum, read_quorum=args.read_quorum,
                 )
             )
 
@@ -598,6 +628,8 @@ async def _run_benchmark(args):
                 "alpha": args.alpha,
                 "alpha_mode": args.alpha_mode,
                 "value_policy": args.value_policy,
+                "write_quorum": args.write_quorum,
+                "read_quorum": args.read_quorum,
                 "dht_latency_ms": args.dht_latency_ms,
                 "dht_latency_jitter_ms": args.dht_latency_jitter_ms,
                 "gateway_host": args.gateway_host,

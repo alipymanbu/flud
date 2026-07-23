@@ -27,6 +27,8 @@ class DHTOperationMetrics:
         self.store_failure_count = 0
         self.store_timeout_count = 0
         self.alpha_samples = []
+        self.cache_hit = False
+        self.write_quorum = None
 
     @property
     def queried_node_count(self):
@@ -64,6 +66,12 @@ class DHTOperationMetrics:
 
     def record_alpha(self, alpha):
         self.alpha_samples.append(int(alpha))
+
+    def set_cache_hit(self, hit):
+        self.cache_hit = bool(hit)
+
+    def set_write_quorum(self, quorum):
+        self.write_quorum = int(quorum)
 
     def record_store_success(self):
         self.store_success_count += 1
@@ -117,6 +125,8 @@ class DHTOperationMetrics:
             "store_failure_count": self.store_failure_count,
             "store_timeout_count": self.store_timeout_count,
             "alpha_samples": self.alpha_samples,
+            "cache_hit": self.cache_hit,
+            "write_quorum": self.write_quorum,
         }
         if self.error is not None:
             data["error"] = self.error

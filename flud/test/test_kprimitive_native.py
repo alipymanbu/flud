@@ -111,6 +111,43 @@ def test_native_sendk_store_and_k_store(flud_target):
     assert recursive_result == ""
 
 
+def test_native_k_store_returns_immediately_on_quorum(flud_target):
+    # Single-node network: the only k_store target is the local node
+    # itself, so write_quorum=1 must still succeed and return "".
+    result = _run(
+        flud_target.node.client.k_store(KEY, TESTVAL, write_quorum=1)
+    )
+    assert result == ""
+
+
+def test_native_k_find_value_cache_hit_skips_network_round_trip(monkeypatch, flud_target):
+    import flud.protocol.ClientDHTPrimitives as dht_primitives
+
+    _run(flud_target.node.client.k_store(KEY, TESTVAL))
+    # k_store proactively caches the value it just wrote; clear that so this
+    # test exercises a genuinely cold first read followed by a cache hit.
+    flud_target.node.dht_cache._store.clear()
+
+    call_count = {"n": 0}
+    real_send_k_find_value = dht_primitives.send_k_find_value
+
+    async def _counting_send_k_find_value(*args, **kwargs):
+        call_count["n"] += 1
+        return await real_send_k_find_value(*args, **kwargs)
+
+    monkeypatch.setattr(dht_primitives, "send_k_find_value", _counting_send_k_find_value)
+
+    first = _run(flud_target.node.client.k_find_value(KEY))
+    assert call_count["n"] >= 1
+    calls_after_first = call_count["n"]
+
+    second = _run(flud_target.node.client.k_find_value(KEY))
+    assert _decode_if_needed(second) == TESTVAL
+    assert first == second
+    # A cache hit must not issue any further network requests.
+    assert call_count["n"] == calls_after_first
+
+
 def test_native_sendk_find_value_and_k_find_value(flud_target):
     _run(
         flud_target.node.client.send_k_store(

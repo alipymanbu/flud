@@ -15,12 +15,16 @@ import random
 import logging
 
 from flud.FludConfig import FludConfig
+from flud.fencode import fencode, fdecode
 from flud.protocol.AiohttpServer import FludAiohttpServer
 from flud.protocol.FludClient import FludClient
+from flud.protocol.ClientDHTPrimitives import _TTLCache, _default_cache_ttl_seconds
 from flud.async_runtime import AsyncHTTPClient, AsyncRuntime
 
 PINGTIME=60
 SYNCTIME=900
+REPUBLISH_TIME=int(os.environ.get("FLUD_DHT_REPUBLISH_INTERVAL_S", 6 * 3600))
+REPUBLISH_CONCURRENCY=5
 
 class FludNode(object):
     """
@@ -41,6 +45,8 @@ class FludNode(object):
         self.DHTtstamp = time.time()+10
         self._use_async_server = True
         self._async_tasks = []
+        self._background_dht_tasks = set()
+        self.dht_cache = _TTLCache(_default_cache_ttl_seconds())
 
     def _initLogger(self):
         logger = logging.getLogger('flud')
@@ -54,8 +60,59 @@ class FludNode(object):
             await asyncio.sleep(SYNCTIME)
             self.config.save()
 
+    async def _async_republish_loop(self):
+        while True:
+            await asyncio.sleep(REPUBLISH_TIME)
+            try:
+                await self._republish_owned_values()
+            except Exception:
+                self.logger.exception("DHT republish cycle failed")
+
+    async def _republish_owned_values(self):
+        """Periodically re-issues k_store for values this node owns (its
+        manifest CAS pointer, and any block metadata it originated), so
+        replicas don't silently expire under churn between file operations.
+        See flud/docs/dht-metadata-performance.md, recommendation A2."""
+        semaphore = asyncio.Semaphore(REPUBLISH_CONCURRENCY)
+
+        async def _store(key, value):
+            async with semaphore:
+                try:
+                    await self.client.k_store(key, value)
+                except Exception as error:
+                    self.logger.info("republish failed for %x: %s", key, error)
+
+        jobs = []
+
+        manifest_cas = getattr(self.config, "manifest_cas", None)
+        if manifest_cas:
+            jobs.append(_store(int(self.config.nodeID, 16), manifest_cas))
+
+        with self.config.manifest_lock:
+            manifest_entries = list(self.config.manifest.items())
+        for _fname, entry in manifest_entries:
+            if not (isinstance(entry, tuple) and len(entry) == 2):
+                continue
+            sK, _tstamp = entry
+            try:
+                cache_path = os.path.join(self.config.metadir, fencode(sK))
+            except Exception:
+                continue
+            if not os.path.isfile(cache_path):
+                continue
+            try:
+                with open(cache_path, "rb") as f:
+                    cached_metadata = fdecode(f.read())
+            except Exception:
+                continue
+            jobs.append(_store(sK, cached_metadata))
+
+        if jobs:
+            await asyncio.gather(*jobs, return_exceptions=True)
+
     def _schedule_async_tasks(self):
         self._async_tasks.append(self.async_runtime.submit(self._async_sync_loop()))
+        self._async_tasks.append(self.async_runtime.submit(self._async_republish_loop()))
 
     def start(self, twistd=False):
         """Starts the asyncio server in this thread."""
@@ -79,6 +136,16 @@ class FludNode(object):
         for task in self._async_tasks:
             task.cancel()
         self._async_tasks = []
+        for task in list(self._background_dht_tasks):
+            # Background DHT tasks may belong to a loop running on a
+            # different thread (async_runtime, the aiohttp server thread,
+            # or a caller's own asyncio.run()); cancel via that loop rather
+            # than calling task.cancel() directly from this thread.
+            try:
+                task.get_loop().call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass  # loop already closed
+        self._background_dht_tasks.clear()
         self.async_http.close()
         self.async_runtime.stop()
 

@@ -129,6 +129,8 @@ class FludConfig:
         self.nodes = {}
         self.throttled = {}  # XXX: should persist this to config file
         self.manifest_lock = threading.RLock()
+        self.manifest_cas = None  # last-published manifest CAS key, used by
+                                   # the DHT republish loop (FludNode.py)
 
         try:
             self.fludhome = os.environ['FLUDHOME']

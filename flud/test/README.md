@@ -94,9 +94,19 @@ Useful benchmark-specific knobs:
 
 - `--alpha`: max in-flight lookup fanout per logical DHT operation
 - `--alpha-mode=fixed|adaptive`: keep alpha constant or tune it from recent RPC outcomes
-- `--value-policy=first|majority`: return on the first value hit or wait for majority support
+- `--value-policy=first|majority|quorum`: return on the first value hit, wait for majority
+  support, or wait for an explicit `--read-quorum` count of matching responses
+- `--write-quorum`: number of the k replica targets a `k_store` must reach before returning
+  (defaults to `floor(k/2)+1`; remaining targets continue as best-effort background stores)
+- `--read-quorum`: with `--value-policy=quorum`, matching-response count required to return
+  (defaults to `k - write_quorum + 1`, satisfying Dynamo-style `W + R > N`)
 - `--cold-only` / `--warm-only`: benchmark only one routing state
 - `--attach`: benchmark an already-running emulated network instead of starting one
+
+Note: the `warm` phases re-query the same keys resolved during `cold`, so
+with the client-side TTL cache (`FLUD_DHT_CACHE_TTL_S`, default 30s) now in
+place, `k_find_value [warm]` will report near-zero latency (a cache hit)
+unless the phase runs longer than the TTL.
 
 ### Simulating network latency
 

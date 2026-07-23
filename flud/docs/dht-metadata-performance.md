@@ -142,29 +142,40 @@ Two smaller observations worth folding into any redesign:
 
 ### A. Near-term, incremental, low risk (stay within the current Kademlia layer)
 
-1. **Quorum writes instead of all-replicas writes.** Change `k_store` to
-   succeed once `W = floor(k/2) + 1` (or a configurable threshold) of the
-   `k` target nodes ack, instead of requiring all `k`. Keep delivering to
-   the stragglers as a best-effort background task rather than raising.
-   This directly removes the all-or-nothing failure mode and mirrors
-   Optimistic Provide's "ack early, finish in the background" pattern.
-2. **Add a republish/refresh loop.** Periodically (on an IPNS-like cadence
-   of hours, not the 15-minute `SYNCTIME` used for local config) re-issue
-   `k_store` for values this node owns — its manifest CAS pointer, and
-   optionally block metadata it originated — so replicas don't silently
-   disappear under churn without requiring a full re-store from scratch.
-3. **Formalize read consistency and add read-repair.** Turn the `first`/
-   `majority` toggle into an explicit `(N, W, R)` quorum configuration
-   (`W + R > N`, sloppy-quorum style, à la Dynamo), and when a majority
-   read detects a stale/minority reply, write the corrected value back to
-   that replica instead of silently ignoring the divergence.
-4. **Add a client-side TTL cache** for recently resolved manifest pointers
-   and block metadata, avoiding repeat full lookups within a session — the
-   same win DNS and IPNS caching layers get from a short-lived local cache.
-5. **Wire reputation into lookup candidate ordering.** Use the existing
-   `Reputation.py` trust scores to bias `_LookupFrontier` candidate
-   ordering, not just XOR distance, reducing wasted RPCs to known-flaky
-   peers (per the Kad-ReDS results above).
+**Status: implemented.** All five items below are live in
+`flud/protocol/ClientDHTPrimitives.py` (plus `flud/FludNode.py` for the
+republish loop). Validate with `flud/test/dht_benchmark.py`'s
+`--write-quorum`, `--read-quorum`, `--value-policy=quorum`, and
+`--dht-latency-ms` flags together — see "Validating these changes" below.
+
+1. **Quorum writes instead of all-replicas writes.** `k_store` now succeeds
+   once `W = floor(k/2) + 1` (or an explicit `write_quorum=`/
+   `--write-quorum`) of the `k` target nodes ack, instead of requiring all
+   `k`. Remaining in-flight stores continue as best-effort background tasks
+   (tracked on `node._background_dht_tasks`, cancelled on node shutdown)
+   rather than failing the caller. Mirrors Optimistic Provide's "ack early,
+   finish in the background" pattern.
+2. **Republish/refresh loop.** `FludNode._async_republish_loop` re-issues
+   `k_store` every `FLUD_DHT_REPUBLISH_INTERVAL_S` (default 6h) for values
+   this node owns: its manifest CAS pointer (`FludConfig.manifest_cas`, set
+   by `UpdateManifest._updateCAS`) and any block metadata it originated,
+   read back from the existing local cache files under `metadir`.
+3. **Formalized (N, W, R) read consistency + read-repair.** `k_find_value`
+   gained a `"quorum"` `value_policy` (alongside unchanged `"first"`/
+   `"majority"`) with an explicit `read_quorum=`/`--read-quorum`, defaulting
+   to `R = N - W + 1` (Dynamo-style `W + R > N`). When a majority/quorum
+   read observes a stale minority value, the correct value is written back
+   to those responders in the background (`_ValueAccumulator.stale_responders`).
+4. **Client-side TTL cache.** `_TTLCache` on each `FludNode` (`node.dht_cache`,
+   TTL via `FLUD_DHT_CACHE_TTL_S`, default 30s) short-circuits repeat
+   `k_find_value` calls for the same key, and `k_store` proactively
+   populates it — a `k_find_value` immediately following a `k_store` for
+   the same key is a local cache hit, strengthening read-your-writes.
+5. **Reputation-aware lookup ordering.** `_LookupFrontier`/`_candidate_sort_key`
+   now demote candidates with negative scores in `FludConfig.reputations`
+   (the actual live reputation store — `flud/Reputation.py` is unused dead
+   code) behind all neutral-or-better candidates, without reordering among
+   well-behaved nodes or penalizing nodes with no history.
 
 ### B. Medium-term, structural, still Kademlia-compatible
 
