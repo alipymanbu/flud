@@ -245,3 +245,16 @@ Any of the recommendations above should be validated by running
 directly, which also exposes `--alpha`, `--alpha-mode`, and
 `--value-policy` knobs) before and after the change, on both cold and warm
 routing-table states, so the impact is measured rather than assumed.
+
+The benchmark's emulated network otherwise runs entirely on loopback
+(sub-millisecond RTT), which hides the multiplicative effect DHT changes
+have on round-trip-bound latency in a real, WAN-connected network. The
+harness now supports `--dht-latency-ms` (fixed, or a `MIN-MAX` range
+resolved once per node for a heterogeneous/asymmetric network) and
+`--dht-latency-jitter-ms`, which inject artificial delay server-side into
+DHT RPCs only (FIND_NODE/FIND_VALUE/STORE — file transfer is unaffected).
+Run the benchmark with and without these flags to see how a change
+performs under realistic RTT, not just at loopback speed; see
+`flud/test/README.md` for details. The same injection is available for
+manual testing via `start-fludnodes`, driven by the underlying
+`FLUD_SIM_DHT_LATENCY_MS` / `FLUD_SIM_DHT_JITTER_MS` environment variables.

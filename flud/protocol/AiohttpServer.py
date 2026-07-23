@@ -29,6 +29,25 @@ from .FludCommUtil import PROTOCOL_VERSION, primitive_to, requireParams, updateN
 logger = logging.getLogger("flud.server.aiohttp")
 
 
+def _resolve_latency_spec_ms(value):
+    """Parses FLUD_SIM_DHT_LATENCY_MS-style values: '' -> 0, 'N' -> N,
+    'MIN-MAX' -> a value drawn once from that range (used to give each node
+    process its own fixed simulated latency, for asymmetric/heterogeneous
+    network emulation)."""
+    if not value:
+        return 0.0
+    value = value.strip()
+    if not value:
+        return 0.0
+    if "-" in value:
+        lo_str, hi_str = value.split("-", 1)
+        lo, hi = float(lo_str), float(hi_str)
+        if hi < lo:
+            lo, hi = hi, lo
+        return random.uniform(lo, hi)
+    return float(value)
+
+
 class _RequestAdapter:
     def __init__(self, request, extra_args=None):
         self.request = request
@@ -68,6 +87,32 @@ class FludAiohttpServer(threading.Thread):
         self._local_server = None
         self._challenges = {}
         self.daemon = True
+
+        self._sim_dht_latency_s = max(
+            0.0, _resolve_latency_spec_ms(os.environ.get("FLUD_SIM_DHT_LATENCY_MS"))
+        ) / 1000.0
+        try:
+            jitter_ms = float(os.environ.get("FLUD_SIM_DHT_JITTER_MS") or 0)
+        except ValueError:
+            jitter_ms = 0.0
+        self._sim_dht_jitter_s = max(0.0, jitter_ms) / 1000.0
+        if self._sim_dht_latency_s or self._sim_dht_jitter_s:
+            logger.info(
+                "simulated DHT latency enabled on port %d: base=%.1fms jitter<=%.1fms",
+                port, self._sim_dht_latency_s * 1000, self._sim_dht_jitter_s * 1000,
+            )
+
+    async def _simulate_dht_latency(self):
+        """Injected delay for DHT RPCs only (FIND_NODE/FIND_VALUE/STORE),
+        used to emulate WAN latency on top of the loopback-speed test/bench
+        network. Configured via FLUD_SIM_DHT_LATENCY_MS (fixed ms, or a
+        'MIN-MAX' range resolved once per node at startup) and
+        FLUD_SIM_DHT_JITTER_MS (extra uniform per-request delay)."""
+        delay = self._sim_dht_latency_s
+        if self._sim_dht_jitter_s:
+            delay += random.uniform(0, self._sim_dht_jitter_s)
+        if delay > 0:
+            await asyncio.sleep(delay)
 
     def _base_headers(self):
         return {
@@ -672,6 +717,7 @@ class FludAiohttpServer(threading.Thread):
         return self._response(text="")
 
     async def _handle_nodes_get(self, request):
+        await self._simulate_dht_latency()
         req = _RequestAdapter(request)
         key = request.match_info["key"]
         try:
@@ -700,6 +746,7 @@ class FludAiohttpServer(threading.Thread):
         return self._response(text="{'id': '%s', 'k': %s}" % (self.node.config.nodeID, kclosest))
 
     async def _handle_meta_put(self, request):
+        await self._simulate_dht_latency()
         req = _RequestAdapter(request)
         key = request.match_info["key"]
         val = request.match_info["val"]
@@ -728,6 +775,7 @@ class FludAiohttpServer(threading.Thread):
         return self._response(text="")
 
     async def _handle_meta_get(self, request):
+        await self._simulate_dht_latency()
         req = _RequestAdapter(request)
         key = request.match_info["key"]
         try:

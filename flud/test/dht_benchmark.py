@@ -89,6 +89,30 @@ def _fludhome(home):
             os.environ["FLUDHOME"] = previous
 
 
+@contextmanager
+def _simulated_dht_latency(args):
+    """Sets the env vars FludAiohttpServer reads to inject artificial delay
+    into DHT RPCs (FIND_NODE/FIND_VALUE/STORE), so this benchmark can be run
+    with and without simulated WAN latency for before/after comparisons.
+    Each node resolves its own value independently at startup, so a
+    'MIN-MAX' spec gives every node its own fixed (heterogeneous) latency."""
+    keys = {}
+    if args.dht_latency_ms:
+        keys["FLUD_SIM_DHT_LATENCY_MS"] = args.dht_latency_ms
+    if args.dht_latency_jitter_ms:
+        keys["FLUD_SIM_DHT_JITTER_MS"] = str(args.dht_latency_jitter_ms)
+    previous = {key: os.environ.get(key) for key in keys}
+    os.environ.update(keys)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def _git_commit():
     try:
         output = subprocess.check_output(
@@ -121,11 +145,11 @@ async def _start_local_cluster(args):
     homes = [Path(temp_root) / f".flud{i}" for i in range(args.nodes)]
     nodes = []
     try:
-        with _fludhome(homes[0]):
+        with _simulated_dht_latency(args), _fludhome(homes[0]):
             gateway = start_test_node(args.base_port)
         nodes.append(gateway)
         for index, home in enumerate(homes[1:], start=1):
-            with _fludhome(home):
+            with _simulated_dht_latency(args), _fludhome(home):
                 node = start_test_node(args.base_port + index)
             node._async_tasks.append(
                 node.async_runtime.submit(
@@ -169,7 +193,7 @@ async def _attach_benchmark_clients(args):
     gateway_port = args.gateway_port or args.base_port
     try:
         for index, home in enumerate(homes):
-            with _fludhome(home):
+            with _simulated_dht_latency(args), _fludhome(home):
                 node = start_test_node(args.base_port + args.nodes + index + 1)
             node._async_tasks.append(
                 node.async_runtime.submit(
@@ -460,6 +484,17 @@ def _build_parser():
     parser.add_argument("--alpha", type=int, default=3)
     parser.add_argument("--alpha-mode", choices=["fixed", "adaptive"], default="fixed")
     parser.add_argument("--value-policy", choices=["first", "majority"], default="first")
+    parser.add_argument(
+        "--dht-latency-ms", default=None,
+        help="Simulated per-hop DHT RPC latency injected server-side "
+             "(FIND_NODE/FIND_VALUE/STORE only). Accepts a fixed value "
+             "('80') or a range ('20-150') resolved once per node, giving "
+             "each node its own fixed latency for heterogeneous/asymmetric "
+             "network emulation. Unset disables injection (loopback speed).")
+    parser.add_argument(
+        "--dht-latency-jitter-ms", type=float, default=0.0,
+        help="Extra uniform random delay (0..jitter) added per DHT RPC on "
+             "top of --dht-latency-ms.")
     parser.add_argument("--output", default=None)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--attach", action="store_true")
@@ -563,6 +598,8 @@ async def _run_benchmark(args):
                 "alpha": args.alpha,
                 "alpha_mode": args.alpha_mode,
                 "value_policy": args.value_policy,
+                "dht_latency_ms": args.dht_latency_ms,
+                "dht_latency_jitter_ms": args.dht_latency_jitter_ms,
                 "gateway_host": args.gateway_host,
                 "gateway_port": cluster.gateway_port,
                 "base_port": args.base_port,

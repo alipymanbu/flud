@@ -98,6 +98,33 @@ Useful benchmark-specific knobs:
 - `--cold-only` / `--warm-only`: benchmark only one routing state
 - `--attach`: benchmark an already-running emulated network instead of starting one
 
+### Simulating network latency
+
+By default every benchmark node runs on loopback, so DHT round trips cost
+close to 0ms — that hides the effect changes have on real, WAN-latency
+networks (DHT cost is dominated by round trips × RTT). Two flags inject an
+artificial delay server-side into DHT RPCs only (FIND_NODE/FIND_VALUE/STORE;
+file transfer and handshake endpoints are unaffected):
+
+- `--dht-latency-ms`: fixed per-hop latency (`80`) or a range (`20-150`)
+  resolved once *per node* at startup, giving each node its own fixed
+  latency for a heterogeneous/asymmetric network instead of a uniform one.
+- `--dht-latency-jitter-ms`: extra uniform random delay (0..jitter) added on
+  top of `--dht-latency-ms` per RPC.
+
+```sh
+poetry run python3 flud/test/dht_benchmark.py \
+  --dht-latency-ms 20-150 \
+  --dht-latency-jitter-ms 15 \
+  --output /tmp/dht-benchmark-wan.json
+```
+
+Run once with these flags unset (baseline) and once with them set, then diff
+the two JSON outputs' `phases[].latency_seconds` to see how a change affects
+real-world round-trip-bound latency, not just loopback speed. The same env
+vars (`FLUD_SIM_DHT_LATENCY_MS`, `FLUD_SIM_DHT_JITTER_MS`) work with
+`start-fludnodes` for manual/interactive testing of an emulated network.
+
 ## Custom Pytest Options
 
 Shared network target:

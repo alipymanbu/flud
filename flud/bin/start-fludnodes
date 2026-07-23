@@ -48,6 +48,9 @@ start_node() {
         cmd+=("$listenport")
         echo "starting {$FLUDHOME} ${cmd[*]} on $listenport"
     fi
+    if [ -n "$FLUD_SIM_DHT_LATENCY_MS" ] || [ -n "$FLUD_SIM_DHT_JITTER_MS" ]; then
+        echo "  simulated DHT latency: base=${FLUD_SIM_DHT_LATENCY_MS:-0}ms jitter<=${FLUD_SIM_DHT_JITTER_MS:-0}ms"
+    fi
     FLUDPORT=$listenport "${cmd[@]}" >"$logfile" 2>&1 &
     local pid=$!
     echo "$pid" > "$pidfile"
