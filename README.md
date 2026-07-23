@@ -74,6 +74,10 @@ These map to:
 - `make test-all`: all pytest-discovered tests
 - `make benchmark-dht`: run the standalone DHT benchmark harness
 
+The DHT benchmark also supports scheduler tuning options such as `--alpha`,
+`--alpha-mode fixed|adaptive`, and `--value-policy first|majority` when run
+directly via `poetry run python3 flud/test/dht_benchmark.py`.
+
 For more detailed test commands, custom pytest options, and the retained manual
 file-op system runner, see [flud/test/README.md](/Users/alenpeacock/code/flud/flud/test/README.md).
 

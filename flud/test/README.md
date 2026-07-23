@@ -84,8 +84,19 @@ poetry run python3 flud/test/dht_benchmark.py \
   --ops-per-phase 100 \
   --concurrency 25 \
   --warmup-ops 150 \
+  --alpha 4 \
+  --alpha-mode adaptive \
+  --value-policy first \
   --output /tmp/dht-benchmark.json
 ```
+
+Useful benchmark-specific knobs:
+
+- `--alpha`: max in-flight lookup fanout per logical DHT operation
+- `--alpha-mode=fixed|adaptive`: keep alpha constant or tune it from recent RPC outcomes
+- `--value-policy=first|majority`: return on the first value hit or wait for majority support
+- `--cold-only` / `--warm-only`: benchmark only one routing state
+- `--attach`: benchmark an already-running emulated network instead of starting one
 
 ## Custom Pytest Options
 

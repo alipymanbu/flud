@@ -109,12 +109,22 @@ class FludClient(object):
     """
     DHT recursive primitives (recursive calls to muliple peers)
     """
-    async def k_find_node(self, key, metrics=None):
-        return await k_find_node(self.node, key, metrics=metrics)
+    async def k_find_node(self, key, metrics=None, alpha=None, alpha_mode="fixed"):
+        return await k_find_node(
+            self.node, key, metrics=metrics, alpha=alpha, alpha_mode=alpha_mode)
     
-    async def k_store(self, key, val, metrics=None):
-        return await k_store(self.node, key, val, metrics=metrics)
+    async def k_store(self, key, val, metrics=None, alpha=None, alpha_mode="fixed"):
+        return await k_store(
+            self.node, key, val, metrics=metrics, alpha=alpha, alpha_mode=alpha_mode)
     
-    async def k_find_value(self, key, metrics=None):
-        return await k_find_value(self.node, key, metrics=metrics)
+    async def k_find_value(self, key, metrics=None, alpha=None, alpha_mode="fixed",
+            value_policy="first"):
+        return await k_find_value(
+            self.node,
+            key,
+            metrics=metrics,
+            alpha=alpha,
+            alpha_mode=alpha_mode,
+            value_policy=value_policy,
+        )
     

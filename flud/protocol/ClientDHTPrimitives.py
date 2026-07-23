@@ -199,49 +199,167 @@ async def _send_k_store(node, host, port, key, val, metrics=None):
                 raise socket.error(str(exc))
 
 
-async def _k_find_node_impl(node, key, op_metrics=None):
+def _normalize_alpha(alpha):
+    if alpha is None:
+        alpha = FludkRouting.a
+    try:
+        alpha = int(alpha)
+    except (TypeError, ValueError):
+        alpha = FludkRouting.a
+    return max(1, alpha)
+
+
+def _normalize_alpha_mode(alpha_mode):
+    mode = (alpha_mode or "fixed").lower()
+    if mode not in ("fixed", "adaptive"):
+        raise ValueError("invalid alpha mode %r" % alpha_mode)
+    return mode
+
+
+def _normalize_value_policy(value_policy):
+    policy = (value_policy or "first").lower()
+    if policy not in ("first", "majority"):
+        raise ValueError("invalid value policy %r" % value_policy)
+    return policy
+
+
+def _candidate_distance(candidate, key):
+    return int(candidate[2]) ^ key
+
+
+def _candidate_sort_key(candidate, key):
+    return (_candidate_distance(candidate, key), int(candidate[2]), candidate[0], candidate[1])
+
+
+def _extract_exact_node_response(response, key):
+    if not isinstance(response, dict):
+        return None
+    candidates = response.get('k', [])
+    if len(candidates) == 1 and int(candidates[0][2]) == key:
+        return response
+    return None
+
+
+class _AlphaController:
+    def __init__(self, base_alpha, mode="fixed"):
+        self.base_alpha = _normalize_alpha(base_alpha)
+        self.mode = _normalize_alpha_mode(mode)
+        self.current_alpha = self.base_alpha
+        self._recent = []
+
+    def alpha(self, frontier_size=0, in_flight=0):
+        if self.mode == "adaptive":
+            ceiling = max(self.base_alpha, min(FludkRouting.k, frontier_size + in_flight))
+            self.current_alpha = max(1, min(self.current_alpha, ceiling or self.base_alpha))
+        else:
+            self.current_alpha = self.base_alpha
+        return self.current_alpha
+
+    def note_result(self, success):
+        if self.mode != "adaptive":
+            return
+        self._recent.append(bool(success))
+        if len(self._recent) > 8:
+            self._recent.pop(0)
+        success_count = sum(1 for item in self._recent if item)
+        failure_count = len(self._recent) - success_count
+        if failure_count >= max(2, len(self._recent) // 2):
+            self.current_alpha = max(1, self.current_alpha - 1)
+        elif success_count >= max(3, len(self._recent) - 1):
+            self.current_alpha = min(FludkRouting.k, self.current_alpha + 1)
+
+
+class _ValueAccumulator:
+    def __init__(self):
+        self.counts = {}
+        self.total = 0
+
+    def observe(self, value):
+        self.total += 1
+        self.counts[value] = self.counts.get(value, 0) + 1
+
+    def best_value(self):
+        if not self.counts:
+            return None
+        return max(self.counts.items(), key=lambda item: (item[1], str(item[0])))[0]
+
+    def should_return(self, policy):
+        if not self.counts:
+            return (False, None)
+        if policy == "first":
+            return (True, self.best_value())
+        best_value, best_count = max(
+            self.counts.items(), key=lambda item: (item[1], str(item[0])))
+        if best_count >= 2 and (best_count > (self.total / 2.0)):
+            return (True, best_value)
+        return (False, None)
+
+
+class _LookupFrontier:
+    def __init__(self, key):
+        self.key = key
+        self._candidates = {}
+
+    def add_many(self, candidates):
+        for candidate in candidates:
+            normalized = tuple(candidate)
+            if len(normalized) < 3:
+                continue
+            normalized = normalized[:2] + (int(normalized[2]),) + normalized[3:]
+            node_id = normalized[2]
+            current = self._candidates.get(node_id)
+            if current is None or _candidate_distance(normalized, self.key) < _candidate_distance(current, self.key):
+                self._candidates[node_id] = normalized
+
+    def pending(self, queried_ids, in_flight_ids):
+        blocked = set(queried_ids) | set(in_flight_ids)
+        return sorted(
+            (candidate for node_id, candidate in self._candidates.items() if node_id not in blocked),
+            key=lambda item: _candidate_sort_key(item, self.key),
+        )
+
+    def best_k(self, exclude_ids=()):
+        excluded = set(exclude_ids)
+        return sorted(
+            (candidate for node_id, candidate in self._candidates.items() if node_id not in excluded),
+            key=lambda item: _candidate_sort_key(item, self.key),
+        )[:FludkRouting.k]
+
+    def has_better_pending(self, threshold_distance, queried_ids, in_flight_ids):
+        blocked = set(queried_ids) | set(in_flight_ids)
+        for candidate in sorted(
+                (candidate for node_id, candidate in self._candidates.items()
+                 if node_id not in blocked),
+                key=lambda item: _candidate_sort_key(item, self.key)):
+            if threshold_distance is None:
+                return True
+            return _candidate_distance(candidate, self.key) < threshold_distance
+        return False
+
+
+async def _k_find_node_impl(node, key, op_metrics=None, alpha=None, alpha_mode="fixed"):
     node.DHTtstamp = time.time()
     queried = {}
-    outstanding = set()
-    pending = []
-    kclosest = []
+    failed = set()
+    frontier = _LookupFrontier(key)
+    controller = _AlphaController(alpha, alpha_mode)
     abbrvkey = ("%x" % key)[:8] + "..."
     abbrv = "(%s%s)" % (abbrvkey, str(node.DHTtstamp)[-7:])
 
     def _update_state(response, host, port):
-        if not isinstance(response, dict):
-            return response
-        if len(response['k']) == 1 and response['k'][0][2] == key:
-            if response['k'][0] not in kclosest:
-                kclosest.insert(0, response['k'][0])
-                del kclosest[FludkRouting.k:]
+        exact = _extract_exact_node_response(response, key)
+        if exact is not None:
+            frontier.add_many(exact.get('k', []))
             if op_metrics:
-                op_metrics.set_returned_candidate_count(len(response['k']))
-            return response
-
+                op_metrics.set_returned_candidate_count(len(exact['k']))
+            return exact
+        if not isinstance(response, dict):
+            return None
         responder_id = int(response['id'], 16)
-        outstanding.discard((host, port, responder_id))
         queried[responder_id] = (host, port)
         if op_metrics:
             op_metrics.record_queried_node(responder_id)
-
-        for candidate in response['k']:
-            node_tuple = (candidate[0], candidate[1], candidate[2])
-            if candidate[2] not in queried and \
-                    node_tuple not in pending and \
-                    node_tuple not in outstanding:
-                pending.append(node_tuple)
-            if candidate not in kclosest:
-                kclosest.append(candidate)
-        kclosest.sort(key=lambda n, t=key: t ^ n[2])
-        del kclosest[FludkRouting.k:]
-
-        pending[:] = list(set(pending) - outstanding)
-        for responder_id, responder_hostport in queried.items():
-            node_tuple = (responder_hostport[0], responder_hostport[1], responder_id)
-            if node_tuple in pending:
-                pending.remove(node_tuple)
-        pending.sort(key=lambda n, t=key: t ^ n[2])
+        frontier.add_many(response.get('k', []))
         return None
 
     localhost = getCanonicalIP('localhost')
@@ -253,58 +371,62 @@ async def _k_find_node_impl(node, key, op_metrics=None):
     if exact is not None:
         return exact
 
-    round_no = 0
-    while pending or outstanding:
-        batch = pending[:FludkRouting.a]
-        pending[:] = pending[len(batch):]
-        if not batch:
+    in_flight = {}
+    wait_count = 0
+    while True:
+        pending = frontier.pending(queried.keys(), (candidate[2] for candidate in in_flight.values()))
+        active_alpha = controller.alpha(len(pending), len(in_flight))
+        if op_metrics:
+            op_metrics.record_alpha(active_alpha)
+        while len(in_flight) < active_alpha and pending:
+            candidate = pending.pop(0)
+            host, port, node_id = candidate[0], candidate[1], candidate[2]
+            task = asyncio.create_task(
+                send_k_find_node(node, host, port, key, metrics=op_metrics))
+            in_flight[task] = candidate
+        if not in_flight:
             break
         if op_metrics:
             op_metrics.record_round()
-        logger.debug("FN: %s doing async round %d", abbrv, round_no)
-        round_no += 1
-
-        async def _query_one(host, port, node_id):
-            outstanding.add((host, port, node_id))
+        logger.debug("FN: %s doing async wait %d", abbrv, wait_count)
+        wait_count += 1
+        done, _ = await asyncio.wait(
+            list(in_flight.keys()), return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            candidate = in_flight.pop(task)
+            host, port, node_id = candidate[0], candidate[1], candidate[2]
             try:
-                response = await send_k_find_node(
-                    node, host, port, key, metrics=op_metrics)
-                return response, host, port
-            finally:
-                outstanding.discard((host, port, node_id))
-
-        results = await asyncio.gather(
-            *(_query_one(host, port, node_id) for host, port, node_id in batch),
-            return_exceptions=True,
-        )
-        for item, result in zip(batch, results):
-            host, port, node_id = item
-            if isinstance(result, Exception):
+                response = await task
+                controller.note_result(True)
+            except Exception as exc:
+                controller.note_result(False)
+                failed.add(node_id)
                 logger.info("kFindNode %s request to %s:%d failed -- %s",
-                        abbrv, host, port, str(result))
-                kclosest[:] = [
-                    n for n in kclosest
-                    if (n[0], n[1], n[2]) != (host, port, node_id)
-                ]
+                        abbrv, host, port, str(exc))
                 continue
-            response, host, port = result
             exact = _update_state(response, host, port)
             if exact is not None:
                 return exact
+        best = frontier.best_k(exclude_ids=failed)
+        threshold = _candidate_distance(best[-1], key) if best else None
+        if not frontier.has_better_pending(
+                threshold, queried.keys(),
+                (candidate[2] for candidate in in_flight.values())) and not in_flight:
+            break
 
     logger.info("kFindNode %s terminated successfully after %d queries.",
             abbrv, len(queried))
-    kclosest.sort(key=lambda n, t=key: t ^ n[2])
-    result = {'k': kclosest[:FludkRouting.k]}
+    result = {'k': frontier.best_k(exclude_ids=failed)}
     if op_metrics:
         op_metrics.set_returned_candidate_count(len(result['k']))
     return result
 
 
-async def k_find_node(node, key, metrics=None):
+async def k_find_node(node, key, metrics=None, alpha=None, alpha_mode="fixed"):
     op_metrics = _operation_trace(metrics, "k_find_node", key=fencode(key))
     try:
-        result = await _k_find_node_impl(node, key, op_metrics=op_metrics)
+        result = await _k_find_node_impl(
+            node, key, op_metrics=op_metrics, alpha=alpha, alpha_mode=alpha_mode)
     except Exception as exc:
         if op_metrics:
             op_metrics.finish_failure(exc, timed_out=_is_timeout_error(exc))
@@ -314,54 +436,32 @@ async def k_find_node(node, key, metrics=None):
     return result
 
 
-async def k_find_value(node, key, metrics=None):
+async def k_find_value(node, key, metrics=None, alpha=None, alpha_mode="fixed",
+        value_policy="first"):
     op_metrics = _operation_trace(metrics, "k_find_value", key=fencode(key))
+    value_policy = _normalize_value_policy(value_policy)
     node.DHTtstamp = time.time()
     queried = {}
-    outstanding = set()
-    pending = []
-    kclosest = []
-    done = False
-    values = {}
+    failed = set()
+    frontier = _LookupFrontier(key)
+    controller = _AlphaController(alpha, alpha_mode)
+    values = _ValueAccumulator()
     abbrvkey = ("%x" % key)[:8] + "..."
     abbrv = "(%s%s)" % (abbrvkey, str(node.DHTtstamp)[-7:])
 
-    def _remember_value(response):
-        values[response] = values.get(response, 0) + 1
-
     def _update_state(response, host, port):
-        nonlocal done
         if not isinstance(response, dict):
             if response is not None:
-                _remember_value(response)
+                values.observe(response)
                 if op_metrics:
+                    op_metrics.record_value_response()
                     op_metrics.set_value_found(True)
-            done = True
-            pending[:] = []
-            outstanding.clear()
             return response
-
         responder_id = int(response['id'], 16)
         queried[responder_id] = (host, port)
         if op_metrics:
             op_metrics.record_queried_node(responder_id)
-        for candidate in response['k']:
-            node_tuple = (candidate[0], candidate[1], candidate[2])
-            if candidate[2] not in queried and \
-                    node_tuple not in pending and \
-                    node_tuple not in outstanding:
-                pending.append(node_tuple)
-            if candidate not in kclosest:
-                kclosest.append(candidate)
-        kclosest.sort(key=lambda n, t=key: t ^ n[2])
-        del kclosest[FludkRouting.k:]
-
-        pending[:] = list(set(pending) - outstanding)
-        for responder_id, responder_hostport in queried.items():
-            node_tuple = (responder_hostport[0], responder_hostport[1], responder_id)
-            if node_tuple in pending:
-                pending.remove(node_tuple)
-        pending.sort(key=lambda n, t=key: t ^ n[2])
+        frontier.add_many(response.get('k', []))
         return None
 
     localhost = getCanonicalIP('localhost')
@@ -370,57 +470,67 @@ async def k_find_value(node, key, metrics=None):
             node, localhost, node.config.port, key, metrics=op_metrics)
         exact = _update_state(initial, localhost, node.config.port)
         if exact is not None and not isinstance(exact, dict):
-            if op_metrics:
-                op_metrics.finish_success()
-            return exact
+            should_return, result = values.should_return(value_policy)
+            if should_return:
+                if op_metrics:
+                    op_metrics.set_early_terminated(True)
+                    op_metrics.finish_success()
+                return result
 
-        round_no = 0
-        while not done and (pending or outstanding):
-            batch = pending[:FludkRouting.a]
-            pending[:] = pending[len(batch):]
-            if not batch:
+        in_flight = {}
+        wait_count = 0
+        while True:
+            pending = frontier.pending(queried.keys(), (candidate[2] for candidate in in_flight.values()))
+            active_alpha = controller.alpha(len(pending), len(in_flight))
+            if op_metrics:
+                op_metrics.record_alpha(active_alpha)
+            while len(in_flight) < active_alpha and pending:
+                candidate = pending.pop(0)
+                host, port, node_id = candidate[0], candidate[1], candidate[2]
+                task = asyncio.create_task(
+                    send_k_find_value(node, host, port, key, metrics=op_metrics))
+                in_flight[task] = candidate
+            if not in_flight:
                 break
             if op_metrics:
                 op_metrics.record_round()
-            logger.debug("FV: %s doing async round %d", abbrv, round_no)
-            round_no += 1
-
-            async def _query_one(host, port, node_id):
-                outstanding.add((host, port, node_id))
+            logger.debug("FV: %s doing async wait %d", abbrv, wait_count)
+            wait_count += 1
+            done, _ = await asyncio.wait(
+                list(in_flight.keys()), return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                candidate = in_flight.pop(task)
+                host, port, node_id = candidate[0], candidate[1], candidate[2]
                 try:
-                    response = await send_k_find_value(
-                        node, host, port, key, metrics=op_metrics)
-                    return response, host, port
-                finally:
-                    outstanding.discard((host, port, node_id))
-
-            results = await asyncio.gather(
-                *(_query_one(host, port, node_id) for host, port, node_id in batch),
-                return_exceptions=True,
-            )
-            for item, result in zip(batch, results):
-                host, port, node_id = item
-                if isinstance(result, Exception):
+                    response = await task
+                    controller.note_result(True)
+                except Exception as exc:
+                    controller.note_result(False)
+                    failed.add(node_id)
                     logger.info("kFindValue %s request to %s:%d failed -- %s",
-                            abbrv, host, port, str(result))
-                    kclosest[:] = [
-                        n for n in kclosest
-                        if (n[0], n[1], n[2]) != (host, port, node_id)
-                    ]
+                            abbrv, host, port, str(exc))
                     continue
-                response, host, port = result
                 exact = _update_state(response, host, port)
                 if exact is not None and not isinstance(exact, dict):
-                    if op_metrics:
-                        op_metrics.finish_success()
-                    return exact
+                    should_return, result = values.should_return(value_policy)
+                    if should_return:
+                        if op_metrics:
+                            op_metrics.set_early_terminated(True)
+                            op_metrics.finish_success()
+                        return result
+            best = frontier.best_k(exclude_ids=failed)
+            threshold = _candidate_distance(best[-1], key) if best else None
+            if not frontier.has_better_pending(
+                    threshold, queried.keys(),
+                    (candidate[2] for candidate in in_flight.values())) and not in_flight:
+                break
 
-        if not values:
+        result = values.best_value()
+        if result is None:
             logger.info("couldn't get any results")
             if op_metrics:
                 op_metrics.finish_success()
             return None
-        result = max(values.items(), key=lambda item: item[1])[0]
         if op_metrics:
             op_metrics.finish_success()
         return result
@@ -430,10 +540,11 @@ async def k_find_value(node, key, metrics=None):
         raise
 
 
-async def k_store(node, key, val, metrics=None):
+async def k_store(node, key, val, metrics=None, alpha=None, alpha_mode="fixed"):
     op_metrics = _operation_trace(metrics, "k_store", key=fencode(key))
     try:
-        knodes = await _k_find_node_impl(node, key, op_metrics=op_metrics)
+        knodes = await _k_find_node_impl(
+            node, key, op_metrics=op_metrics, alpha=alpha, alpha_mode=alpha_mode)
         knodes = knodes['k']
         if op_metrics:
             op_metrics.set_store_destination_count(len(knodes))
