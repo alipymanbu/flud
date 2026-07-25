@@ -11,7 +11,6 @@ import pytest
 pytest.importorskip("Cryptodome.Cipher")
 
 import flud.FludFileOperations as fileops
-from flud.fencode import fdecode
 from flud.test._primitive_data import create_case_file
 
 
@@ -47,12 +46,14 @@ def _gather(awaitables):
     return asyncio.run(_collect())
 
 
-def _list_meta(config):
-    with open(os.path.join(config.metadir, config.manifest_name), "r") as handle:
-        manifest = handle.read()
-    if manifest == "":
-        return {}
-    return fdecode(manifest)
+def _manifest_has_all(config, paths):
+    async def _check():
+        for path in paths:
+            if await config.getFromManifest(path) is None:
+                return False
+        return True
+
+    return asyncio.run(_check())
 
 
 def _crc32(path):
@@ -113,9 +114,7 @@ def stored_fileops(flud_cluster, fileop_cases):
 
 
 def test_native_fileops_store_updates_master_metadata(flud_cluster, stored_fileops):
-    master = _list_meta(flud_cluster.client.config)
-    for path in stored_fileops.all_paths:
-        assert path in master
+    assert _manifest_has_all(flud_cluster.client.config, stored_fileops.all_paths)
 
 
 def test_native_fileops_retrieve_round_trips_unique_small(flud_cluster, stored_fileops):
@@ -145,6 +144,5 @@ def test_native_fileops_same_path_double_store(flud_cluster, fileop_cases):
     _run(fileops.store_file(node, path))
     _run(fileops.store_file(node, path))
 
-    master = _list_meta(node.config)
-    assert path in master
+    assert _manifest_has_all(node.config, [path])
     _assert_round_trip(node, path)

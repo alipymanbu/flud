@@ -209,7 +209,11 @@ class AsyncLocalServer:
                 message.as_string(),
             )
         if command == "LIST":
-            return self.config.manifest
+            path = fname or os.sep
+            children = await self.config.listManifestChildren(path)
+            if children is None:
+                raise LookupError("no such manifest directory: %s" % path)
+            return children
         if command == "GETM":
             return await self._run_fileop(FileOps.retrieve_manifest, self.node)
         if command == "PUTM":

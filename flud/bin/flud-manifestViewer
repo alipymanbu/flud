@@ -5,49 +5,139 @@ flud-manifestViewer (c) 2003-2006 Alen Peacock.  This program is
 distributed under the terms of the GNU General Public License (the GPL),
 version 3.
 
-Utility for displaying the manifest.
+Utility for displaying a flud manifest tree.
+
+Two explicit modes, since they have very different failure characteristics
+(instant/offline vs. slow/disaster-recovery-shaped) and shouldn't be
+conflated into one code path that silently picks:
+
+  local [path]   Walk the LOCAL manifest.db directly (no network at all).
+                  Fast, works even if the node isn't running.
+  network        Ask an already-running local flud node (via its local RPC
+                  port) to GETM -- triggers a full walk over the DHT to
+                  reconstruct the manifest from scratch, then displays it.
 """
 
-import sys, os
-import configparser
+import argparse
+import asyncio
+import os
+import sqlite3
+import sys
 
-from flud.fencode import fencode, fdecode
-from flud.FludCrypto import FludRSA
+from flud.fencode import fdecode
+
+
+def _open_local_db(metadir):
+    db_path = os.path.join(metadir, "manifest.db")
+    if not os.path.isfile(db_path):
+        raise SystemExit("no local manifest.db found at %s" % db_path)
+    return sqlite3.connect(db_path)
+
+
+def _get_node(db, node_hash):
+    if node_hash is None:
+        return None
+    row = db.execute(
+            "SELECT blob FROM nodes WHERE hash = ?", (node_hash,)).fetchone()
+    if row is None:
+        return None
+    return fdecode(row[0])
+
+
+def _get_root(db):
+    row = db.execute("SELECT root_hash FROM root WHERE id = 0").fetchone()
+    return row[0] if row and row[0] is not None else None
+
+
+def _resolve_path(db, root_hash, path):
+    node = _get_node(db, root_hash)
+    if node is None:
+        return None
+    if path in ("", os.sep):
+        return node
+    for name in [p for p in path.split(os.sep) if p]:
+        ref = node.get("children", {}).get(name)
+        if not (isinstance(ref, dict) and "hash" in ref):
+            return None
+        node = _get_node(db, ref["hash"])
+        if node is None:
+            return None
+    return node
+
+
+def _print_tree(db, node, path, recurse):
+    if node is None:
+        print("(not found: %s)" % path)
+        return
+    print("%s  meta=%s" % (path, node.get("meta")))
+    for name, ref in sorted(node.get("children", {}).items()):
+        child_path = os.path.join(path, name)
+        if isinstance(ref, dict) and "hash" in ref:
+            if recurse:
+                _print_tree(db, _get_node(db, ref["hash"]), child_path, recurse)
+            else:
+                print("%s/  (dir, hash=%s)" % (child_path, ref["hash"]))
+        else:
+            sK, timestamp = ref
+            print("%s  (file, sK=%r, stored=%s)" % (child_path, sK, timestamp))
+
+
+def cmd_local(args):
+    fludhome = args.fludhome or os.environ.get("FLUDHOME") \
+            or os.path.join(os.environ["HOME"], ".flud")
+    metadir = os.path.join(fludhome, "meta")
+    db = _open_local_db(metadir)
+    root_hash = _get_root(db)
+    if root_hash is None:
+        print("(empty manifest -- no root published locally yet)")
+        return
+    node = _resolve_path(db, root_hash, args.path)
+    _print_tree(db, node, args.path or os.sep, recurse=not args.no_recurse)
+
+
+async def _network_getm(clientport):
+    from flud.protocol.AsyncLocalClient import AsyncLocalClient
+    from flud.FludConfig import FludConfig
+
+    config = FludConfig()
+    config.load(doLogging=False)
+    client = AsyncLocalClient(config, port=clientport or config.clientport)
+    try:
+        result = await client.sendGETM()
+        print(result)
+    finally:
+        await client.close()
+
+
+def cmd_network(args):
+    asyncio.run(_network_getm(args.clientport))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+            formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="mode", required=True)
+
+    local = sub.add_parser("local",
+            help="walk the local manifest.db directly, no network")
+    local.add_argument("path", nargs="?", default="/",
+            help="tree path to start at (default: /)")
+    local.add_argument("--fludhome", default=None,
+            help="defaults to $FLUDHOME, then ~/.flud")
+    local.add_argument("--no-recurse", action="store_true",
+            help="only show the immediate children of `path`")
+    local.set_defaults(func=cmd_local)
+
+    network = sub.add_parser("network",
+            help="ask a running local flud node to GETM over the DHT "
+                 "(disaster-recovery-shaped: can be slow)")
+    network.add_argument("--clientport", type=int, default=None,
+            help="defaults to the running node's configured client port")
+    network.set_defaults(func=cmd_network)
+
+    args = parser.parse_args()
+    args.func(args)
+
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("usage: %s <filename> " % sys.argv[0])
-        sys.exit()
-    else:
-        fname = sys.argv[1]
-        raw = False
-    
-    try:
-        # try to use Ku to decrypt metadata
-        try:
-            fludhome = os.environ['FLUDHOME']
-        except:
-            home = os.environ['HOME']
-            fludhome = home+"/.flud"
-        fludconfig = fludhome+"/flud.conf"
-        c = configparser.ConfigParser()
-        if os.path.isfile(fludconfig) == True:
-            conffile = open(fludconfig, "r")
-            c.readfp(conffile)
-        privkey = FludRSA.importPrivateKey( 
-                eval(c.get("identification","Kr"))) 
-    except:
-        privkey = None
-
-    f = os.open(fname, os.O_RDONLY)
-    data = os.read(f,1280000)
-    os.close(f)
-    #print "fencoded data is '%s'" % data
-    data = fdecode(data)
-    for i in data:
-        if isinstance(data[i],dict):
-            print("%s -> %s" % (i, data[i]))
-    print("--------------------")
-    for i in data:
-        if not isinstance(data[i],dict):
-            print("%s (%d) <- %s" % (fencode(data[i][0]), data[i][1], i))
+    main()

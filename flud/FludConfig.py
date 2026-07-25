@@ -5,13 +5,24 @@ the terms of the GNU General Public License (the GPL), version 3.
 manages configuration file for flud backup.
 """
 
-import os, sys, socket, re, logging, time, threading
+import os, sys, socket, re, logging, time, threading, asyncio, sqlite3
 import configparser
 
 import flud.FludCrypto as FludCrypto
 from flud.FludCrypto import FludRSA
 from flud.FludkRouting import kRouting
 from flud.fencode import fencode, fdecode
+
+
+def _manifest_ancestor_chain(fname):
+    """Mirrors FludFileOperations.pathsplit(): the full ancestor chain from
+    the filesystem root through fname itself, e.g. "/a/b/c.txt" ->
+    ["/", "/a", "/a/b", "/a/b/c.txt"]. Duplicated locally (rather than
+    imported) to avoid a circular import with FludFileOperations."""
+    par, chld = os.path.split(fname)
+    if chld == "":
+        return [par]
+    return _manifest_ancestor_chain(par) + [os.path.join(par, chld)]
 
 logger = logging.getLogger('flud')
 
@@ -128,9 +139,20 @@ class FludConfig:
         self.reputations = {}
         self.nodes = {}
         self.throttled = {}  # XXX: should persist this to config file
-        self.manifest_lock = threading.RLock()
-        self.manifest_cas = None  # last-published manifest CAS key, used by
-                                   # the DHT republish loop (FludNode.py)
+        self.manifest_lock = threading.RLock()  # vestigial: no longer guards
+                                                  # anything since the manifest
+                                                  # moved to a SQLite-backed
+                                                  # tree (see manifest_tree_lock)
+        self.manifest_cas = None  # last-published manifest DHT pointer value
+                                   # (a {"fmt":2,"root":...} dict once published
+                                   # -- see FludFileOperations.UpdateManifest),
+                                   # used by the DHT republish loop (FludNode.py)
+        self.manifest_tree_lock = None  # lazy asyncio.Lock; see
+                                         # _manifest_tree_lock()
+        self._manifest_tree_lock_loop = None  # event loop manifest_tree_lock
+                                               # is currently bound to
+        self._manifest_db = None  # lazy sqlite3 connection; see
+                                   # _manifest_db_connect()
 
         try:
             self.fludhome = os.environ['FLUDHOME']
@@ -607,59 +629,341 @@ class FludConfig:
             logger.debug("returning all %d of the items" % len(items))
             return [self.routing.getNode(f) for (f,v) in items]
 
-    # XXX: note that this manifest all-in-mem scheme doesn't really work
-    # long term; these methods should eventually go to a local db or db-like
-    # something
-    def updateManifest(self, fname, val): 
-        """
-        update fname with val (sK)
-        """
-        with self.manifest_lock:
-            self.manifest[fname] = val
+    # The manifest is a content-addressed tree, mirroring the local
+    # filesystem hierarchy: each directory is its own small object listing
+    # its children (a bare (sK, timestamp) tuple for a file child, or a
+    # {"hash": ...} reference for a subdirectory child); only the root's
+    # hash is a mutable pointer. Locally cached in a small SQLite db
+    # (metadir/manifest.db); the same node objects are individually
+    # k_store'd to the DHT (see FludFileOperations.UpdateManifest). See
+    # flud/docs/dht-metadata-performance.md tier B for the design rationale.
+    #
+    # updateManifest/getFromManifest/deleteFromManifest keep their original
+    # (path, value) / (path) -> value call signatures so most callers in
+    # FludFileOperations.py don't need to change, but are now async and
+    # operate on the tree instead of a flat dict.
 
-    def getFromManifest(self, fname):
-        """
-        get val (sK) for fname
-        """
-        with self.manifest_lock:
-            try:
-                return self.manifest[fname]
-            except:
+    def _manifest_tree_lock(self):
+        # asyncio.Lock binds to whichever event loop is running the first
+        # time it's acquired, and raises if later acquired from a
+        # different loop. FludConfig objects can legitimately outlive a
+        # single event loop (e.g. a long-lived shared node reused across
+        # several separate asyncio.run() calls, as flud's own test suite
+        # does with session/module-scoped node fixtures) -- recreate the
+        # lock whenever the running loop has changed, rather than reusing
+        # one bound to a now-closed loop. Safe: asyncio guarantees only one
+        # loop runs at a time per thread, so a loop change means the old
+        # loop (and anything that might have been contending for the old
+        # lock) is no longer running.
+        loop = asyncio.get_running_loop()
+        if self._manifest_tree_lock_loop is not loop:
+            self.manifest_tree_lock = asyncio.Lock()
+            self._manifest_tree_lock_loop = loop
+        return self.manifest_tree_lock
+
+    def _manifest_db_connect(self):
+        if self._manifest_db is None:
+            db_path = os.path.join(self.metadir, "manifest.db")
+            db = sqlite3.connect(db_path, check_same_thread=False)
+            # WAL mode lets unprotected reads (republish/PUTM tree walks,
+            # which deliberately run outside manifest_tree_lock per the
+            # design doc) proceed concurrently with a lock-protected write,
+            # without blocking on or corrupting either.
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS nodes "
+                "(hash TEXT PRIMARY KEY, blob BLOB NOT NULL)")
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS root "
+                "(id INTEGER PRIMARY KEY CHECK (id = 0), root_hash TEXT)")
+            db.commit()
+            self._manifest_db = db
+        return self._manifest_db
+
+    @staticmethod
+    def _manifest_canonical_children(children):
+        return sorted(children.items(), key=lambda kv: kv[0])
+
+    def _manifest_node_hash(self, node):
+        canonical = {
+            "meta": node.get("meta"),
+            "children": self._manifest_canonical_children(
+                node.get("children", {})),
+        }
+        return FludCrypto.hashstring(fencode(canonical))
+
+    def _manifest_get_node_sync(self, node_hash):
+        if node_hash is None:
+            return None
+        db = self._manifest_db_connect()
+        row = db.execute(
+            "SELECT blob FROM nodes WHERE hash = ?", (node_hash,)).fetchone()
+        if row is None:
+            return None
+        return fdecode(row[0])
+
+    def _manifest_put_node_sync(self, node):
+        node_hash = self._manifest_node_hash(node)
+        db = self._manifest_db_connect()
+        blob = fencode(node)
+        if isinstance(blob, str):
+            blob = blob.encode("utf-8")
+        db.execute(
+            "INSERT OR REPLACE INTO nodes (hash, blob) VALUES (?, ?)",
+            (node_hash, blob))
+        db.commit()
+        return node_hash
+
+    def _manifest_get_root_sync(self):
+        db = self._manifest_db_connect()
+        row = db.execute("SELECT root_hash FROM root WHERE id = 0").fetchone()
+        if row is None or row[0] is None:
+            return None
+        return row[0]
+
+    def _manifest_set_root_sync(self, node_hash):
+        db = self._manifest_db_connect()
+        db.execute(
+            "INSERT INTO root (id, root_hash) VALUES (0, ?) "
+            "ON CONFLICT(id) DO UPDATE SET root_hash = excluded.root_hash",
+            (node_hash,))
+        db.commit()
+
+    def _manifest_apply_update_sync(self, fname, val):
+        """Sets fname's value in the tree (a bare (sK, timestamp) tuple for
+        a file, or a filemetadata()-shaped dict for a directory) and
+        propagates the resulting hash change up through every ancestor to
+        the root. Local-only (never touches the network) -- must be called
+        with the manifest tree lock held (or during single-threaded
+        startup migration, before any concurrency is possible)."""
+        chain = _manifest_ancestor_chain(fname)
+
+        if len(chain) == 1:
+            # fname IS the tree root itself -- a root meta update.
+            root_hash = self._manifest_get_root_sync()
+            node = self._manifest_get_node_sync(root_hash) \
+                or {"meta": None, "children": {}}
+            node["meta"] = val
+            self._manifest_set_root_sync(self._manifest_put_node_sync(node))
+            return
+
+        ancestor_paths = chain[:-1]  # root .. fname's immediate parent
+        target_name = os.path.basename(fname)
+
+        # Resolve each ancestor's current node top-down (local-only;
+        # missing nodes are treated as freshly-created empty ones).
+        hashes = [self._manifest_get_root_sync()]
+        nodes = []
+        for idx, path in enumerate(ancestor_paths):
+            node = self._manifest_get_node_sync(hashes[idx]) \
+                or {"meta": None, "children": {}}
+            nodes.append(node)
+            if idx + 1 < len(ancestor_paths):
+                child_name = os.path.basename(ancestor_paths[idx + 1])
+                ref = node["children"].get(child_name)
+                hashes.append(
+                    ref["hash"] if isinstance(ref, dict) and "hash" in ref
+                    else None)
+
+        deepest = nodes[-1]
+        if isinstance(val, dict):
+            # fname is itself a directory: fetch/create its own node and
+            # set its meta, preserving any children already recorded under
+            # it (e.g. a file stored moments earlier in the same
+            # StoreFile call, before this ancestor's meta was assigned).
+            existing_ref = deepest["children"].get(target_name)
+            existing_hash = (
+                existing_ref["hash"]
+                if isinstance(existing_ref, dict) and "hash" in existing_ref
+                else None)
+            child_node = self._manifest_get_node_sync(existing_hash) \
+                or {"meta": None, "children": {}}
+            child_node["meta"] = val
+            child_hash = self._manifest_put_node_sync(child_node)
+            deepest["children"][target_name] = {"hash": child_hash}
+        else:
+            # fname is a file: embed its (sK, timestamp) ref directly --
+            # no separate node/hash-hop needed for leaves.
+            deepest["children"][target_name] = val
+
+        new_hash = self._manifest_put_node_sync(deepest)
+        for idx in range(len(nodes) - 2, -1, -1):
+            parent_node = nodes[idx]
+            child_name = os.path.basename(ancestor_paths[idx + 1])
+            parent_node["children"][child_name] = {"hash": new_hash}
+            new_hash = self._manifest_put_node_sync(parent_node)
+        self._manifest_set_root_sync(new_hash)
+
+    def _manifest_resolve_node_sync(self, path):
+        """Local-only path resolution: walks from root to `path`, one
+        component at a time. Returns the dirnode dict at `path`, the bare
+        (sK, timestamp) tuple if `path` names a file, or None if not
+        found locally."""
+        chain = _manifest_ancestor_chain(path)
+        node = self._manifest_get_node_sync(self._manifest_get_root_sync())
+        if node is None:
+            return None
+        if len(chain) == 1:
+            return node
+        for component_path in chain[1:]:
+            name = os.path.basename(component_path)
+            ref = node["children"].get(name)
+            if ref is None:
                 return None
+            if isinstance(ref, dict) and "hash" in ref:
+                node = self._manifest_get_node_sync(ref["hash"])
+                if node is None:
+                    return None
+            elif component_path == chain[-1]:
+                return ref  # file leaf
+            else:
+                return None  # file ref encountered mid-path -- invalid
+        return node
 
-    def deleteFromManifest(self, fname):
+    async def updateManifest(self, fname, val):
         """
-        remove fname
+        update fname with val: a bare (sK, timestamp) tuple for a file, or
+        a filemetadata()-shaped dict for a directory.
         """
-        with self.manifest_lock:
-            try: 
-                self.manifest.pop(fname)
-            except:
-                pass
+        async with self._manifest_tree_lock():
+            await asyncio.to_thread(self._manifest_apply_update_sync, fname, val)
+
+    async def getFromManifest(self, fname):
+        """
+        get val for fname: a (sK, timestamp) tuple for a file, a
+        filemetadata()-shaped dict (or None if not yet set) for a
+        directory, or None if fname isn't present at all.
+        """
+        async with self._manifest_tree_lock():
+            result = await asyncio.to_thread(
+                self._manifest_resolve_node_sync, fname)
+        if result is None:
+            return None
+        if isinstance(result, dict):
+            return result.get("meta")
+        return result
+
+    async def listManifestChildren(self, path):
+        """
+        Returns the immediate children of the directory at `path` (a dict
+        of {name: (sK, timestamp) | {"hash": ...}}), or None if `path`
+        doesn't resolve to a directory. Local-only.
+        """
+        async with self._manifest_tree_lock():
+            node = await asyncio.to_thread(
+                self._manifest_resolve_node_sync, path)
+        if not isinstance(node, dict):
+            return None
+        return dict(node.get("children", {}))
+
+    async def deleteFromManifest(self, fname):
+        """
+        Deletion isn't implemented: it would require the same bottom-up
+        rehash-and-propagate machinery as updateManifest, plus a decision
+        about pruning now-empty ancestor dirnodes, and has zero callers
+        anywhere in the codebase today. Logs and no-ops rather than
+        silently doing nothing incorrect or crashing.
+        """
+        logger.warning(
+            "deleteFromManifest(%s) called but is not implemented "
+            "(tree-based manifest, no callers exist yet)", fname)
+
+    def _manifest_walk_reachable_sync(self, root_hash):
+        """Returns [(hash, node_dict), ...] for every node reachable from
+        root_hash (BFS over subdirectory {"hash": ...} refs). Read-only,
+        local-only. Used to publish/republish the tree to the DHT."""
+        if root_hash is None:
+            return []
+        seen = {}
+        queue = [root_hash]
+        while queue:
+            h = queue.pop()
+            if h in seen:
+                continue
+            node = self._manifest_get_node_sync(h)
+            if node is None:
+                continue
+            seen[h] = node
+            for ref in node.get("children", {}).values():
+                if isinstance(ref, dict) and "hash" in ref:
+                    queue.append(ref["hash"])
+        return list(seen.items())
+
+    async def snapshotManifestRoot(self):
+        """Briefly locks to read the current root hash consistently, then
+        releases -- callers should walk/publish outside the lock (see
+        walkManifestReachable) so a long walk doesn't block concurrent
+        local writes."""
+        async with self._manifest_tree_lock():
+            return self._manifest_get_root_sync()
+
+    async def walkManifestReachable(self, root_hash):
+        """[(hash, node_dict), ...] for every node reachable from
+        root_hash. Local-only, read-only, deliberately NOT lock-protected
+        (see snapshotManifestRoot) -- WAL mode allows this to run
+        concurrently with in-flight local writes without blocking either."""
+        return await asyncio.to_thread(
+            self._manifest_walk_reachable_sync, root_hash)
+
+    async def getManifestNode(self, node_hash):
+        """Fetches a single node by hash, local-only (None if not cached
+        locally). Used for disaster-recovery-style reconstruction, where
+        each network-fetched node is inserted via putManifestNode."""
+        return await asyncio.to_thread(self._manifest_get_node_sync, node_hash)
+
+    async def putManifestNode(self, node):
+        """Inserts a node (already fetched from the network, or freshly
+        built) into local storage, returning its hash. Does NOT touch the
+        root pointer -- callers set that separately via setManifestRoot
+        once the whole tree they care about is locally present."""
+        return await asyncio.to_thread(self._manifest_put_node_sync, node)
+
+    async def setManifestRoot(self, root_hash):
+        await asyncio.to_thread(self._manifest_set_root_sync, root_hash)
 
     def loadManifest(self):
         """
-        loads fname->sK mappings from file
+        Opens (creating if needed) the local manifest tree db. If this
+        node has an old-format flat-file manifest but no tree yet,
+        migrates it once: the old file's entries are replayed into the
+        tree purely from local data (no network needed), and the old file
+        is preserved (renamed), not deleted, so a rollback to old code
+        degrades gracefully instead of crashing on a missing file.
         """
-        manifest_file = open(os.path.join(self.metadir, self.manifest_name), 'r')
-        manifest = manifest_file.read()
-        manifest_file.close()
-        if manifest == "":
-            manifest = {}
-        else:
-            manifest = fdecode(manifest)
-        with self.manifest_lock:
-            self.manifest = manifest
+        self._manifest_db_connect()
+        if self._manifest_get_root_sync() is not None:
+            return  # already using the tree format
+
+        manifest_path = os.path.join(self.metadir, self.manifest_name)
+        if not os.path.isfile(manifest_path):
+            return  # brand new node, nothing to migrate
+        with open(manifest_path, 'r') as f:
+            raw = f.read()
+        if raw == "":
+            return
+        old_manifest = fdecode(raw)
+        if not old_manifest:
+            return
+
+        logger.info(
+            "migrating manifest from flat-dict format to content-addressed "
+            "tree (%d entries)", len(old_manifest))
+        for old_fname, old_val in old_manifest.items():
+            self._manifest_apply_update_sync(old_fname, old_val)
+
+        backup_path = manifest_path + ".pre-tree-migration"
+        os.rename(manifest_path, backup_path)
+        logger.info(
+            "manifest migration complete; old manifest preserved at %s",
+            backup_path)
 
     def syncManifest(self):
         """
-        sync in-mem fname->sK mappings to disk
+        Vestigial: every tree mutation now commits directly to
+        manifest.db as it happens, so there's no in-memory state left to
+        flush. Kept as a no-op so existing callers don't need to change.
         """
-        with self.manifest_lock:
-            manifest = fencode(self.manifest)
-        manifest_file = open(os.path.join(self.metadir, self.manifest_name), 'w')
-        manifest_file.write(manifest)
-        manifest_file.close()
+        pass
         
     def _test(self):
         import doctest

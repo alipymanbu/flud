@@ -492,7 +492,7 @@ class StoreFile:
                 self._verifyBlockChain(i, sfile, mfile, seg, segl, nID, noopVerify)
             )
         await asyncio.gather(*coros, return_exceptions=True)
-        return self._updateMaster(None, storedMetadata)
+        return await self._updateMaster(None, storedMetadata)
 
     async def _verifyBlockChain(self, i, sfile, mfile, seg, segl, nID, noopVerify):
         try:
@@ -530,7 +530,7 @@ class StoreFile:
                 continue
             coros.append(self._attachMetadataChain(nID, segl, mfile))
         await asyncio.gather(*coros, return_exceptions=True)
-        return self._updateMaster(None, storedMetadata)
+        return await self._updateMaster(None, storedMetadata)
 
     async def _attachMetadataChain(self, nID, segl, mfile):
         try:
@@ -630,10 +630,10 @@ class StoreFile:
         logger.debug(self.ctx("storing metadata at %s", fencode(self.sK)))
         logger.debug(self.ctx("len(segMetadata) = %d", len(self.blockMetadata)))
         result = await self.node.client.k_store(self.sK, self.blockMetadata)
-        return self._updateMaster(result, self.blockMetadata)
+        return await self._updateMaster(result, self.blockMetadata)
 
     # 7 - update local manifest record (store it to the network later).
-    def _updateMaster(self, res, meta):
+    async def _updateMaster(self, res, meta):
         # clean up locally coded files and encrypted file
         for sfile in self.sfiles:
             os.remove(sfile)
@@ -648,18 +648,13 @@ class StoreFile:
         # store the filekey locally
 
         # update entry for file
-        with self.config.manifest_lock:
-            self.config.updateManifest(self.filename, (self.sK, int(time.time())))
+        await self.config.updateManifest(self.filename, (self.sK, int(time.time())))
 
-            # update entry for parent dirs
-            paths = pathsplit(self.filename)
-            for i in paths:
-                if not self.config.getFromManifest(i):
-                    self.config.updateManifest(i, filemetadata(i))
-
-            # XXX: not too efficient to write this out for every file.  consider
-            # local caching and periodic syncing instead
-            self.config.syncManifest()
+        # update entry for parent dirs
+        paths = pathsplit(self.filename)
+        for i in paths:
+            if not await self.config.getFromManifest(i):
+                await self.config.updateManifest(i, filemetadata(i))
 
         # cache the metadata locally (optional)
         fname = os.path.join(self.metadir,key)
@@ -1030,7 +1025,7 @@ class RetrieveFile:
             self.decodeData, self.mfname, list(self.fsmetas.values()),
             self.config.clientdir
         )
-        return self._decodeDone(decoded, metadecoded)
+        return await self._decodeDone(decoded, metadecoded)
 
     def decodeData(self, outfname, datafnames, datadir=None):
         logger.info(self.ctx("decoding %s to %s" % (datafnames, outfname)))
@@ -1149,12 +1144,12 @@ class RetrieveFile:
         await asyncio.sleep(delay)
         return await self._retrieveFileAsync()
 
-    def _decodeDone(self, decoded, metadecoded):
+    async def _decodeDone(self, decoded, metadecoded):
         if not self.decoded and decoded and metadecoded:
             logger.info(self.ctx("successfully decoded (retrieved %d blocks --"
-                    " all but %d blocks tried)" % (self.numBlocksRetrieved, 
+                    " all but %d blocks tried)" % (self.numBlocksRetrieved,
                         len(self.meta))))
-            return self._decryptMeta() 
+            return await self._decryptMeta()
         else:
             logger.info(self.ctx("decoded=%s, mdecoded=%s" % (decoded, 
                 metadecoded)))
@@ -1162,7 +1157,7 @@ class RetrieveFile:
                     "decoded=%s, mdecoded=%s" % (
                         self.numBlocksRetrieved, decoded, metadecoded))
 
-    def _decryptMeta(self):
+    async def _decryptMeta(self):
         # XXX: decrypt the metadatafile with Kr to get all the nmeta stuff (eeK
         # etc.)
         #mfile = open(os.path.join(self.parentcodedir, fencode(self.sK)+".m"))
@@ -1180,9 +1175,9 @@ class RetrieveFile:
                 pass
             return self._schedule_retry("metadata decode failed")
         os.remove(self.mfname)
-        return self._decryptFile()
+        return await self._decryptFile()
     
-    def _decryptFile(self):
+    async def _decryptFile(self):
         # 3: Retrieve eK from sK by eK=Kr(eeK).  Use eK to decrypt file.  Strip
         #    off leading pad.
         skey = fencode(self.sK)
@@ -1322,11 +1317,9 @@ class RetrieveFile:
                 if not os.path.exists(i) and i != fmeta['path']:
                     os.mkdir(i) # best effort dir creation, even if missing
                                 # directory metadata
-                    # XXX: should be using an accessor method on config for
-                    # manifest
-                    if i in self.config.manifest:
-                        dirmeta = self.config.getFromManifest(i)
-                        os.chmod(i,dirmeta['mode']) 
+                    dirmeta = await self.config.getFromManifest(i)
+                    if dirmeta:
+                        os.chmod(i,dirmeta['mode'])
                         os.chown(i,dirmeta['uid'],dirmeta['gid']) # XXX: windows
                         # XXX: atim, mtim, ctim
                     # XXX: should try to make sure we can write to dir, change
@@ -1359,35 +1352,50 @@ class RetrieveFilename:
         self.config = self.node.config
 
     async def run(self):
-        fmeta = self.config.getFromManifest(self.filename)
+        # RetrieveFile will restore parent dirs, so we don't need to.
+        dlist = await self._collect_directory_recoveries(self.filename)
+        if dlist is not None:
+            logger.debug("%s is a directory in the manifest", self.filename)
+            return await self._gatherRecoveries(dlist)
+
+        fmeta = await self.config.getFromManifest(self.filename)
         if fmeta:
-            if isinstance(fmeta, dict):
-                logger.debug("%s is a directory in the manifest", 
-                        self.filename)
-                # RetrieveFile will restore parent dirs, so we don't need to
-                dlist = []
-                dirname = self.filename+os.path.sep
-                # XXX: this should be calling a config.getAllFromMasterMeta()
-                for i in [x for x in list(self.config.manifest.keys()) 
-                        if dirname == x[:len(dirname)]]:
-                    filekey = self.config.getFromManifest(i)
-                    metakey = _crc32_value(i)
-                    logger.debug("calling RetrieveFile %s" % filekey)
-                    dlist.append(retrieve_file(self.node, fencode(filekey),
-                            metakey))
-                return await self._gatherRecoveries(dlist)
-            else:
-                logger.debug("%s is a file in the manifest", self.filename)
-                (filekey, backuptime) = self.config.getFromManifest(
-                        self.filename)
-                metakey = _crc32_value(self.filename)
-                if filekey != None and filekey != "":
-                    logger.debug("calling RetrieveFile %s" % filekey)
-                    return await retrieve_file(self.node, fencode(filekey),
-                            metakey)
-                raise LookupError("bad filekey %s for %s"
-                        % (filekey, self.filename))
+            logger.debug("%s is a file in the manifest", self.filename)
+            (filekey, backuptime) = fmeta
+            metakey = _crc32_value(self.filename)
+            if filekey != None and filekey != "":
+                logger.debug("calling RetrieveFile %s" % filekey)
+                return await retrieve_file(self.node, fencode(filekey),
+                        metakey)
+            raise LookupError("bad filekey %s for %s"
+                    % (filekey, self.filename))
         raise LookupError("no record of %s" % self.filename)
+
+    async def _collect_directory_recoveries(self, path):
+        """Recursively gathers retrieve_file() coroutines for every file
+        under `path`, or None if `path` doesn't resolve to a directory at
+        all. (The manifest tree's children map only lists immediate
+        children, so nested subdirectories are walked explicitly here --
+        the old flat-dict prefix-scan this replaces matched all
+        descendants at any depth but blindly assumed each match was a
+        file, which broke on nested directories; this fixes that.)"""
+        children = await self.config.listManifestChildren(path)
+        if children is None:
+            return None
+        dlist = []
+        for name, ref in children.items():
+            child_path = os.path.join(path, name)
+            if isinstance(ref, dict) and "hash" in ref:
+                sub = await self._collect_directory_recoveries(child_path)
+                if sub:
+                    dlist.extend(sub)
+            else:
+                filekey, backuptime = ref
+                metakey = _crc32_value(child_path)
+                logger.debug("calling RetrieveFile %s" % filekey)
+                dlist.append(retrieve_file(self.node, fencode(filekey),
+                        metakey))
+        return dlist
 
     async def _gatherRecoveries(self, operations):
         results = await asyncio.gather(*operations, return_exceptions=True)
@@ -1440,39 +1448,88 @@ class VerifyFile:
         
 
 class RetrieveManifest:
-    
+    """
+    Fetches this node's published manifest pointer. If it's the current
+    tree format ({"fmt": 2, "root": <hash>}), reconstructs the whole tree
+    locally by walking it (fetching from the network anything not already
+    cached locally) -- this is the disaster-recovery path: wipe local
+    state, GETM, everything comes back from the network. If it's the
+    legacy bare-CAS format (published before this node's manifest storage
+    was migrated to a tree), falls back to the original erasure-coded-blob
+    retrieval so data published before an upgrade is still recoverable.
+    """
+
     def __init__(self, node):
         self.node = node
-        nodeID = int(self.node.config.nodeID, 16)
-        logger.info("looking for key %x" % nodeID)
-        self.nodeID = nodeID
+        self.nodeID = int(self.node.config.nodeID, 16)
+
     async def run(self):
-        return await self._retrieve_manifest(self.nodeID)
+        return await self._retrieve_manifest()
 
-    async def _retrieve_manifest(self, nodeID):
+    async def _retrieve_manifest(self):
         try:
-            CAS = await self.node.client.k_find_value(nodeID)
+            pointer = await self.node.client.k_find_value(self.nodeID)
         except Exception as err:
+            return self._retrieveManifestErr(err, "couldn't find manifest")
+        if pointer is None:
             return self._retrieveManifestErr(
-                err, "couldn't find manifest")
-        return await self._foundCAS(CAS)
+                LookupError("no manifest published for this node"),
+                "couldn't find manifest")
+        return await self._foundPointer(fdecode(pointer))
 
-    def _foundCAS(self, CAS):
-        if isinstance(CAS, dict):
-            raise ValueError("couldn't find CAS key")
-        CAS = fdecode(CAS)
-        return self._retrieve_found_master(CAS)
+    async def _foundPointer(self, decoded):
+        if isinstance(decoded, dict) and decoded.get("fmt") == 2 \
+                and "root" in decoded:
+            return await self._retrieve_tree(decoded["root"])
+        return await self._retrieve_legacy(decoded)
 
-    async def _retrieve_found_master(self, CAS):
+    async def _retrieve_tree(self, root_hash):
+        fetched = 0
+        seen = set()
+        queue = [root_hash]
+        while queue:
+            h = queue.pop()
+            if h in seen:
+                continue
+            seen.add(h)
+            node = await self.node.config.getManifestNode(h)
+            if node is None:
+                try:
+                    raw = await self.node.client.k_find_value(int(h, 16))
+                except Exception as err:
+                    return self._retrieveManifestErr(
+                        err, "couldn't fetch manifest node %s" % h)
+                if raw is None:
+                    return self._retrieveManifestErr(
+                        LookupError("manifest node %s not found" % h),
+                        "couldn't fetch manifest node %s" % h)
+                node = fdecode(raw)
+                if not isinstance(node, dict) or "children" not in node:
+                    return self._retrieveManifestErr(
+                        ValueError("malformed manifest node %s" % h),
+                        "couldn't fetch manifest node %s" % h)
+                stored_hash = await self.node.config.putManifestNode(node)
+                if stored_hash != h:
+                    logger.warning(
+                        "fetched manifest node hash mismatch: "
+                        "expected %s, got %s", h, stored_hash)
+            fetched += 1
+            for ref in node.get("children", {}).values():
+                if isinstance(ref, dict) and "hash" in ref:
+                    queue.append(ref["hash"])
+        await self.node.config.setManifestRoot(root_hash)
+        logger.info("manifest recovered from network: %d nodes", fetched)
+        return {"fmt": 2, "root": root_hash, "nodes_recovered": fetched}
+
+    async def _retrieve_legacy(self, CAS):
         try:
             result = await retrieve_file(self.node, CAS)
         except Exception as err:
-            return self._retrieveManifestErr(
-                err, "couldn't find manifest")
-        return self._foundManifest(result)
+            return self._retrieveManifestErr(err, "couldn't find manifest")
+        return self._foundLegacyManifest(result)
 
-    def _foundManifest(self, result):
-        if len(result) == 2: 
+    def _foundLegacyManifest(self, result):
+        if len(result) == 2:
             # got two filenames back, must mean we should choose one: the
             # one from the distributed store
             os.rename(result[0], result[1])
@@ -1483,47 +1540,49 @@ class RetrieveManifest:
         logger.warning(msg)
         return err
 
+
 class UpdateManifest:
+    """
+    Publishes this node's local manifest tree to the DHT: every reachable
+    node (from the current local root) is k_store'd -- cheap and
+    idempotent, since unchanged subtrees just republish identical content
+    under the same hash -- then a tagged pointer {"fmt": 2, "root": <hash>}
+    is published under this node's own DHT key.
+    """
 
     def __init__(self, node):
         self.node = node
-        self.manifest_path = os.path.join(self.node.config.metadir,
-                self.node.config.manifest_name)
+
     async def run(self):
         return await self._update_manifest()
 
     async def _update_manifest(self):
+        root_hash = await self.node.config.snapshotManifestRoot()
+        nodes = await self.node.config.walkManifestReachable(root_hash)
+        for node_hash, node in nodes:
+            try:
+                await self.node.client.k_store(int(node_hash, 16), node)
+            except Exception as err:
+                return self._updateManifestErr(
+                    err, "couldn't store manifest node %s" % node_hash)
+        return await self._updateCAS(root_hash)
+
+    async def _updateCAS(self, root_hash):
+        if root_hash is None:
+            logger.info("no local manifest tree yet -- nothing to publish")
+            return None
+        pointer = {"fmt": 2, "root": root_hash}
+        logger.info("publishing manifest root %s at %x", root_hash,
+                int(self.node.config.nodeID, 16))
         try:
-            res = await retrieve_manifest(self.node)
-            self._removeOldManifest(res)
-        except Exception as err:
-            res = err
-        return await self._storeManifest(res)
-
-    def _removeOldManifest(self, res):
-        print("removing old manifest not yet implemented")
-        return res
-
-    def _storeManifest(self, res_or_err):
-        print("going to store %s" % self.manifest_path)
-        return self._store_manifest_async()
-
-    async def _store_manifest_async(self):
-        try:
-            stored = await store_file(self.node, self.manifest_path)
+            result = await self.node.client.k_store(
+                int(self.node.config.nodeID, 16), pointer)
         except Exception as err:
             return self._updateManifestErr(
-                err, "couldn't store manifest")
-        return await self._updateCAS(stored)
-
-    async def _updateCAS(self, stored):
-        key, meta = stored
-        logger.info("storing %s at %x" % (key,
-            int(self.node.config.nodeID,16)))
-        result = await self.node.client.k_store(int(self.node.config.nodeID,16), key)
-        # Cached so the DHT republish loop can keep this pointer alive under
-        # churn without re-encoding/re-storing the whole manifest each time.
-        self.node.config.manifest_cas = key
+                err, "couldn't publish manifest root")
+        # Cached so the DHT republish loop can keep this pointer alive
+        # under churn without re-walking/re-storing the whole tree.
+        self.node.config.manifest_cas = pointer
         return result
 
     def _updateManifestErr(self, err, msg):

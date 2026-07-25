@@ -148,6 +148,30 @@ republish loop). Validate with `flud/test/dht_benchmark.py`'s
 `--write-quorum`, `--read-quorum`, `--value-policy=quorum`, and
 `--dht-latency-ms` flags together — see "Validating these changes" below.
 
+**Bug found and fixed while validating A1.** Chaos-testing quorum writes
+against a network with a killed node exposed a pre-existing, unrelated
+correctness bug in the base Kademlia lookup: `_LookupFrontier.pending()`
+and `has_better_pending()` excluded candidates already `queried` or
+`in_flight`, but never candidates already recorded as `failed`. A node
+that failed a request was removed from `in_flight` but never added to
+`queried`, so it reappeared as "pending" and was re-queried on *every*
+iteration of the lookup loop — indefinitely, since connection-refused
+fails near-instantly and nothing else bounded the loop. In practice this
+meant any `k_find_node`/`k_find_value`/`k_store` call touching a
+routing-table-known peer that had actually gone offline would spin
+forever, logging continuously (observed: ~70MB of log output per node in
+under 25 seconds). This is normal peer churn for a P2P network, not an
+edge case, and nothing in the prior test suite exercised "issue a lookup
+after a known peer has already died," so it had gone undetected. Fixed by
+threading `failed_ids` into both methods' blocked-set
+(`ClientDHTPrimitives.py`); regression tests added in
+`test_dht_scheduler_native.py`. This is the reason a literal "kill N node
+processes, then store" benchmark doesn't actually exercise write-quorum
+tolerance — a genuinely dead node is now filtered out during the FIND_NODE
+lookup phase before the STORE fan-out ever begins. The scenario that
+*does* exercise it is a node that stays reachable for lookups but fails
+specifically on the STORE call, which is what A1's quorum write is for.
+
 1. **Quorum writes instead of all-replicas writes.** `k_store` now succeeds
    once `W = floor(k/2) + 1` (or an explicit `write_quorum=`/
    `--write-quorum`) of the `k` target nodes ack, instead of requiring all
@@ -179,23 +203,120 @@ republish loop). Validate with `flud/test/dht_benchmark.py`'s
 
 ### B. Medium-term, structural, still Kademlia-compatible
 
-6. **Replace "manifest as a single mutable blob" with an append-only,
-   content-addressed log.** Instead of re-encoding and re-storing the
-   *entire* manifest on every change, store manifest entries as immutable,
-   hash-linked records — a small Merkle-DAG/Merkle-CRDT log, in the spirit
-   of Willow's path/timestamp model or the Merkle-CRDT designs used by
-   OrbitDB/Textile ThreadDB. Only the *head* pointer still needs the
-   expensive mutable-DHT-write path; individual entries reuse flud's
-   existing (and already efficient) content-addressed storage. This also
-   gives concurrent writers to the same node's manifest a merge path
-   instead of a last-writer-wins race — this is what actually closes the
-   atomicity gap that the purely-local `manifest_lock` cannot cover on its
-   own.
-7. **Batch DHT operations for bulk workloads.** When storing many files or
-   blocks in one run (flud's dominant workload is a backup pass), batch
-   lookups the way Provide Sweep does: walk the routing table once and
-   reuse it across keys destined for topologically nearby nodes, instead of
-   issuing one independent `alpha`-bounded lookup per key.
+**Status: implemented.** Item 6 shipped as a git-tree-object-style
+content-addressed **tree**, not the append-only hash-linked log originally
+proposed above — that pivot happened mid-implementation and is worth
+recording. A log with periodic checkpoints was the first design, but it
+needed a checkpoint-interval tuning knob, `prev`-chain replay logic, and
+still didn't give real piecemeal recovery below the checkpoint boundary.
+A directory-tree structure (each directory is its own small content-addressed
+object listing its children; only the root hash is a mutable pointer — the
+same shape as a git tree object or IPFS UnixFS) gets everything the log
+design was straining for and is simpler: O(depth) update cost instead of
+O(checkpoint interval), true piecemeal recovery at any granularity (walk
+from root, resolve one path component at a time), and no history-chain
+bookkeeping at all. It also better matches `FludFileVersions.py`'s own
+stated design philosophy (version history belongs in a local tool, not
+flud's network layer) — the log design accidentally built a de facto
+history mechanism nothing asked for; a pure current-state tree doesn't.
+Per explicit decision, local storage was also fully unified with the DHT
+representation (a local SQLite cache of the same tree nodes), replacing
+`FludConfig`'s flat in-memory dict + full-file-rewrite-per-save scheme,
+which the original maintainers had already flagged as not viable long
+term (`FludConfig.py`, "this manifest all-in-mem scheme doesn't really
+work long term").
+
+6. **Manifest as a content-addressed tree, local storage unified with the
+   DHT representation.** `FludConfig.py` holds the tree in a local SQLite
+   db (`metadir/manifest.db`); `FludFileOperations.py`'s `StoreFile`
+   writes into it locally (fast, offline, `manifest_tree_lock`-protected)
+   on every file store, and `UpdateManifest`/`RetrieveManifest` (`PUTM`/
+   `GETM`) publish/fetch it to/from the DHT — walking every locally-reachable
+   node and `k_store`-ing each (cheap, idempotent — unchanged subtrees
+   republish identical content under the same hash) instead of re-encoding
+   the whole manifest as one erasure-coded blob on every publish. The
+   published pointer is version-tagged (`{"fmt": 2, "root": <hash>}`) so a
+   node can still recover manifests published before this migration via
+   the original blob-based path. A node's existing flat-file manifest is
+   auto-migrated to the tree once, locally, on first load after upgrading
+   (the old file is kept as a `.pre-tree-migration` backup, not deleted).
+   `flud-manifestViewer` and the `LIST` local-client command were rewritten
+   to match (`LIST [path]`, local-vs-network modes for the viewer).
+   **Two real, pre-existing bugs were found and fixed/documented along the
+   way** (see "Bugs found" below) — the same pattern as tier A's chaos-testing
+   discovery: exercising a code path for the first time surfaced latent
+   issues nothing had ever hit before.
+7. **Batch DHT operations for bulk workloads — implemented as concurrent
+   client dispatch, not DHT-level batching (see below for why).**
+   `AsyncLocalClient.sendPUTF` now flattens a directory subtree and
+   dispatches file stores concurrently across a small pool of sibling
+   connections (`sendPUTF(path, concurrency=8)`), instead of walking one
+   directory level at a time and awaiting each file's full store
+   sequentially. Measured **2.57x wall-clock speedup** (10 files,
+   concurrency=8 vs. forced concurrency=1) — not full N-way, since
+   `StoreFile`'s hashing/erasure-coding still run inline on flud's single
+   `async_runtime` event-loop thread with no offload (a separate, pre-existing
+   characteristic, not something this change fixes); the win is from
+   overlapping the network-round-trip portions of concurrently-dispatched
+   stores.
+
+   **Scope note vs. the original proposal.** True DHT-level "Provide
+   Sweep"-style batching (one node answering about multiple keys in a
+   single request, actually reducing RPC count) was considered and
+   explicitly descoped after investigation: `AsyncLocalClient.request()`
+   already fully serializes each call's round trip under one lock, so a
+   single client instance can't provide any real concurrency at all
+   regardless of DHT-level changes — that had to be fixed first, and fixing
+   it (via connection pooling) already captures most of the practical
+   "bulk backups are faster" value on its own. The wire protocol also has
+   no request-correlation ID, so genuine single-connection multiplexing
+   isn't safe without a protocol change — a bigger, riskier lift than this
+   scope called for. Left as a future "B7.5" if benchmarks ever show the
+   remaining gap matters.
+
+**Bugs found while implementing B6/B7** (pre-existing or introduced-then-caught,
+unrelated to each other — exercising real code paths for the first time is
+what surfaced them):
+- **A bug in this implementation itself, caught by re-running the official
+  suite after a port conflict cleared**: `manifest_tree_lock` (an
+  `asyncio.Lock`) bound to whichever event loop was running the first time
+  it was acquired, and raised `RuntimeError: ... is bound to a different
+  event loop` on later use from a different one. `FludConfig` objects can
+  legitimately outlive a single event loop — `conftest.py`'s session-scoped
+  `flud_cluster` fixture reuses one node/config across many
+  `test_fileop_native.py` test functions, each wrapping its calls in a
+  fresh `asyncio.run()`. Fixed by tracking which loop the lock is bound to
+  and recreating it on change (safe: asyncio guarantees only one loop runs
+  per thread at a time, so a loop change means the old loop, and anything
+  that might have contended for the old lock, is no longer running).
+  Regression-tested (`test_manifest_tree_survives_reuse_across_separate_event_loops`).
+- **A confirmed, concrete concurrency bug in the original flat-dict
+  manifest**, caught during design review before it could ship: `AsyncLocal.py`
+  configures `COMMAND_LIMITS["PUTF"] = 300` (up to 300 concurrent file
+  stores is an intentional, already-used feature), and the old manifest
+  update was safe only because it was fully synchronous with zero `await`
+  points — a tree design that introduced yield points into that same
+  critical section would have let concurrent sibling-file stores silently
+  drop each other's directory entries. Fixed by design: `manifest_tree_lock`
+  serializes the whole "resolve ancestor chain → write → propagate to
+  root" sequence. Regression-tested (`test_manifest_tree_native.py`,
+  25 concurrent sibling stores, all survive).
+- **A latent concurrency race in `RetrieveFile`'s temp/download-file
+  handling**, found while testing B6: `RetrieveFilename`'s directory
+  retrieval gathers per-file `retrieve_file()` calls concurrently — a code
+  path that could never actually run before, since the old flat-dict
+  directory listing it replaced crashed on any real nested directory
+  (matched all descendants at any depth, not just immediate children, and
+  assumed every match was a file). Now that directory retrieval works,
+  concurrent retrieval of *different* files occasionally produces "share
+  header parse errors" / missing files under `clientdir` — apparent
+  temp-file handling that isn't safe under concurrent multi-file retrieval.
+  **Not fixed** (out of scope — it's in block-retrieval internals, a
+  separate subsystem from manifest storage) but documented here as a
+  known, real, reproducible issue worth its own investigation; the test
+  suite works around it by testing storage/tree-walk correctness and
+  retrieval correctness separately rather than relying on the concurrent
+  path (see `test_manifest_tree_directory_walk_finds_all_nested_files`).
 
 ### C. Longer-term architectural rethink
 

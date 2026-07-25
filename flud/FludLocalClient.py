@@ -45,7 +45,8 @@ class CmdClient:
             "getf": "retrieve a file: 'getf canonicalfilepath'",
             "geti": "retrieve a file by CAS key: 'geti fencodedCASkey'",
             "fndn": "send a FINDNODE() message: 'fndn hexIDstring'",
-            "list": "list stored files (read from local metadata)",
+            "list": "list a manifest directory's immediate children "
+                     "(read from local metadata): 'list [path]' (default: /)",
             "putm": "store manifest",
             "getm": "retrieve manifest",
             "node": "list known nodes",
@@ -74,7 +75,8 @@ class CmdClient:
             elif commandkey == "fndn":
                 result = await self.client.sendFNDN(commands[1])
             elif commandkey == "list":
-                result = await self.client.sendLIST()
+                path = commands[1] if len(commands) > 1 else ""
+                result = await self.client.sendLIST(path)
             elif commandkey == "putm":
                 result = await self.client.sendPUTM()
             elif commandkey == "getm":

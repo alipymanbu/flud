@@ -69,10 +69,26 @@ class FludNode(object):
                 self.logger.exception("DHT republish cycle failed")
 
     async def _republish_owned_values(self):
-        """Periodically re-issues k_store for values this node owns (its
-        manifest CAS pointer, and any block metadata it originated), so
-        replicas don't silently expire under churn between file operations.
-        See flud/docs/dht-metadata-performance.md, recommendation A2."""
+        """Periodically re-issues k_store for values this node owns, so
+        replicas don't silently expire under churn between file
+        operations. See flud/docs/dht-metadata-performance.md,
+        recommendation A2 (republish loop) and tier B (manifest tree).
+
+        Three distinct things get republished:
+        1. The manifest pointer under this node's own DHT key (a
+           {"fmt": 2, "root": <hash>} dict once a manifest has been
+           published at least once via PUTM).
+        2. Every manifest tree node reachable from the *current* local
+           root -- cheap and idempotent (unchanged nodes republish
+           identical content under the same hash). The root is snapshotted
+           under a brief lock hold, then the walk/publish happens outside
+           the lock so it doesn't block concurrent local writes; a
+           publish can therefore lag slightly behind the very latest local
+           change, which the next cycle (or an explicit PUTM) catches up.
+        3. Block metadata this node originated for each file leaf found
+           during that same walk, read back from the existing local cache
+           files under metadir (unrelated to the manifest tree itself).
+        """
         semaphore = asyncio.Semaphore(REPUBLISH_CONCURRENCY)
 
         async def _store(key, value):
@@ -88,12 +104,16 @@ class FludNode(object):
         if manifest_cas:
             jobs.append(_store(int(self.config.nodeID, 16), manifest_cas))
 
-        with self.config.manifest_lock:
-            manifest_entries = list(self.config.manifest.items())
-        for _fname, entry in manifest_entries:
-            if not (isinstance(entry, tuple) and len(entry) == 2):
-                continue
-            sK, _tstamp = entry
+        root_hash = await self.config.snapshotManifestRoot()
+        reachable = await self.config.walkManifestReachable(root_hash)
+        file_sKs = []
+        for node_hash, node in reachable:
+            jobs.append(_store(int(node_hash, 16), node))
+            for ref in node.get("children", {}).values():
+                if isinstance(ref, tuple) and len(ref) == 2:
+                    file_sKs.append(ref[0])
+
+        for sK in file_sKs:
             try:
                 cache_path = os.path.join(self.config.metadir, fencode(sK))
             except Exception:
