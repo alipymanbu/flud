@@ -1,91 +1,25 @@
-# flud backup
+# flud
 
-flud backup is experimental software. This release *is not* meant for use as a reliable backup mechanism. It is capable of performing backup and restore of data, especially among networks of trusted nodes, or for experiments and measurements on emulated flud networks contained on a single computer. The software is very much a work in progress, and major components of the architecture are not complete.
+本仓库是「flud」的安卓版本获取入口，附使用资料索引。
 
-The next releases of flud backup will contain functional trust and fairness mechanisms that will allow, for the first time, the instantiation of the public flud network. Until then, this release serves as a preview and experimentation platform.
+## 安装文件资源（夸克网盘）
 
-## Installation
+> **flud 安装文件资源（夸克网盘）**：[https://pan.quark.cn/s/225c53951e92](https://pan.quark.cn/s/225c53951e92)
 
-See `INSTALL` for guidance on installing flud backup.
+## 官方项目
 
-## Running
+- 上游项目：[alenpeacock/flud](https://github.com/alenpeacock/flud)
 
-Start a flud node:
+## 更多资料
 
-```sh
-fludnode <bootstraphost> <bootstrapport>
-```
+- [下载与安装教程](https://github.com/alipymanbu/Android/blob/master/%E5%AE%98%E7%BD%91%E7%89%88APP%E4%B8%8B%E8%BD%BD/flud/%E4%B8%8B%E8%BD%BD%E4%B8%8E%E5%AE%89%E8%A3%85%E6%95%99%E7%A8%8B.md)
+- [RSS订阅自动下载设置](https://github.com/alipymanbu/Android/blob/master/%E5%AE%98%E7%BD%91%E7%89%88APP%E4%B8%8B%E8%BD%BD/flud/RSS%E8%AE%A2%E9%98%85%E8%87%AA%E5%8A%A8%E4%B8%8B%E8%BD%BD%E8%AE%BE%E7%BD%AE.md)
+- [Tracker添加与连接设置](https://github.com/alipymanbu/Android/blob/master/%E5%AE%98%E7%BD%91%E7%89%88APP%E4%B8%8B%E8%BD%BD/flud/Tracker%E6%B7%BB%E5%8A%A0%E4%B8%8E%E8%BF%9E%E6%8E%A5%E8%AE%BE%E7%BD%AE.md)
+- [下载慢与常见问题排查](https://github.com/alipymanbu/Android/blob/master/%E5%AE%98%E7%BD%91%E7%89%88APP%E4%B8%8B%E8%BD%BD/flud/%E4%B8%8B%E8%BD%BD%E6%85%A2%E4%B8%8E%E5%B8%B8%E8%A7%81%E9%97%AE%E9%A2%98%E6%8E%92%E6%9F%A5.md)
+- [流量下载被限制怎么办](https://github.com/alipymanbu/Android/blob/master/%E5%AE%98%E7%BD%91%E7%89%88APP%E4%B8%8B%E8%BD%BD/flud/%E6%B5%81%E9%87%8F%E4%B8%8B%E8%BD%BD%E8%A2%AB%E9%99%90%E5%88%B6%E6%80%8E%E4%B9%88%E5%8A%9E.md)
+- [磁力链接与种子下载操作](https://github.com/alipymanbu/Android/blob/master/%E5%AE%98%E7%BD%91%E7%89%88APP%E4%B8%8B%E8%BD%BD/flud/%E7%A3%81%E5%8A%9B%E9%93%BE%E6%8E%A5%E4%B8%8E%E7%A7%8D%E5%AD%90%E4%B8%8B%E8%BD%BD%E6%93%8D%E4%BD%9C.md)
+- [全部软件目录](https://github.com/alipymanbu/Android/blob/master/%E5%85%A8%E9%83%A8%E8%BD%AF%E4%BB%B6%E7%9B%AE%E5%BD%95.md)
 
-If this is the first node in the flud network, you can omit the bootstrap host and port. When the public flud network becomes more generally available, an alternate mechanism will be used to automatically find and use it.
+---
 
-Other processes:
-
-```sh
-fludscheduler      # start the scheduler
-fludlocalclient    # start a command-line client
-```
-
-All of the above commands honor the `FLUDHOME` environment variable for alternate locations of the `~/.flud` directory.
-The shipped runtime is asyncio-native.
-
-## Experimenting
-
-Start an emulated flud network of N nodes:
-
-```sh
-start-fludnodes N
-```
-
-View storage consumed by flud nodes in an emulated flud network:
-
-```sh
-gauges-fludnodes ~/.flud 1-n
-```
-
-Stop the emulated flud network of N nodes:
-
-```sh
-stop-fludnodes N
-```
-
-Clean out data from all emulated flud nodes:
-
-```sh
-clean-fludnodes
-```
-
-## Testing
-
-Common test entry points are available through `make`:
-
-```sh
-make test
-make test-integration
-make test-stress
-make test-all
-make benchmark-dht
-```
-
-These map to:
-
-- `make test`: native pytest suite excluding stress tests
-- `make test-integration`: tests marked `integration`
-- `make test-stress`: tests marked `stress`
-- `make test-all`: all pytest-discovered tests
-- `make benchmark-dht`: run the standalone DHT benchmark harness
-
-The DHT benchmark also supports scheduler tuning options such as `--alpha`,
-`--alpha-mode fixed|adaptive`, and `--value-policy first|majority|quorum`
-(with `--write-quorum`/`--read-quorum`), plus `--dht-latency-ms` and
-`--dht-latency-jitter-ms` to inject simulated WAN latency into DHT RPCs (the
-emulated network otherwise runs at loopback speed), when run directly via
-`poetry run python3 flud/test/dht_benchmark.py`.
-
-For more detailed test commands, custom pytest options, and the retained manual
-file-op system runner, see [flud/test/README.md](/Users/alenpeacock/code/flud/flud/test/README.md).
-
-See http://www.flud.org/wiki/Emulated_flud_Networks for instructions and examples of how to run and test emulated flud networks.
-
-## Feedback
-
-All discussion, feedback, and bug reports should be directed to the flud-devel mailing list at `flud-devel@flud.org` (archive and subscriber information at http://flud.org/mailman/listinfo/flud-devel_flud.org).
+> 本仓库由上游项目 fork 而来，原始说明见[上游仓库](https://github.com/alenpeacock/flud)。
